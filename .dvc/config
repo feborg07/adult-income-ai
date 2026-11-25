@@ -1,5 +1,5 @@
 [core]
-    remote = storage
-['remote "storage"']
-    url = s3://tt-project-17-054886546281-us-east-2-an/dvc-public
+    remote = adult-income-ai
+['remote "adult-income-ai"']
+    url = s3://tt-project-17-054886546281-us-east-2-an/adult-income-ai
     allow_anonymous_login = true
