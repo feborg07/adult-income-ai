@@ -1,17 +1,18 @@
-"""Compare Sprint 17 training candidates using the MLflow tracking store.
+"""Compare Adult Income AI candidates using the MLflow tracking store.
 
 Usage (from the repository root):
     python -m scripts.compare_experiments
     python -m scripts.compare_experiments --top 10
     python -m scripts.compare_experiments --variant baseline
     python -m scripts.compare_experiments --execution-id <FULL_EXECUTION_ID>
-    python -m scripts.compare_experiments --mode all  # include smoke checks
+    python -m scripts.compare_experiments --mode all  # include validation runs
+    python -m scripts.compare_experiments --evaluation cv --execution-id <CV_EXECUTION_ID>
     python -m scripts.compare_experiments --output reports/mlflow_comparison.csv
 
-By default, only full-training runs are compared. Quick runs are smoke checks,
-not eligible for promotion; inspect them only with --mode quick or --mode all.
-The primary ranking metric is validation F1 (metrics.val_f1). This script
-never selects models using held-out test metrics and never promotes models.
+By default, compare full-mode holdout candidates by validation F1.
+CV comparisons default to validation-only runs and rank by mean fold F1.
+Never combine evaluation protocols or incompatible CV settings in one ranking.
+This script never evaluates the test partition or promotes models.
 """
 
 from __future__ import annotations
@@ -25,7 +26,11 @@ import pandas as pd
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-METRIC = "metrics.val_f1"
+METRIC = "metrics.val_f1"  # Retain the historical holdout metric constant.
+CV_COMPARISON_PARAMS = (
+    "params.data_version", "params.seed", "params.n_splits",
+    "params.calibration_size", "params.threshold_policy",
+)
 EXECUTION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -58,6 +63,29 @@ def load_settings(config_path: Path) -> tuple[str, Path, list[str]]:
     return experiment, db_path.resolve(), variants
 
 
+def ranking_metrics(evaluation: str) -> tuple[str, str, str]:
+    """Return the three ranking metrics for an explicit evaluation protocol."""
+    if evaluation not in ("holdout", "cv"):
+        raise ValueError("Evaluation must be holdout or cv.")
+    prefix = "cv" if evaluation == "cv" else "val"
+    return tuple(f"metrics.{prefix}_{name}" for name in ("f1", "pr_auc", "roc_auc"))
+
+
+def validate_cv_comparability(runs: pd.DataFrame) -> None:
+    """Reject missing or incompatible CV data, seed, split or threshold settings."""
+    for column in CV_COMPARISON_PARAMS:
+        if column not in runs or runs[column].isna().any():
+            raise ValueError(f"Missing CV comparison metadata: {column}.")
+        values = runs[column].astype(str).str.strip()
+        if values.eq("").any():
+            raise ValueError(f"Missing CV comparison metadata: {column}.")
+        if values.nunique() != 1:
+            raise ValueError(
+                f"Incompatible CV comparison metadata: {column}. "
+                "Use --execution-id to compare one compatible execution."
+            )
+
+
 def rank_candidates(
     runs: pd.DataFrame,
     *,
@@ -65,24 +93,44 @@ def rank_candidates(
     variant: str | None = None,
     execution_id: str | None = None,
     variant_order: list[str] | None = None,
+    evaluation: str = "holdout",
 ) -> pd.DataFrame:
     """Select successful candidate runs with valid F1, sorted best first.
 
     The training pipeline logs separate 'final_test' records. Requiring a
     candidate family and variant excludes these and unrelated MLflow runs.
     """
+    metric, pr_auc, roc_auc = ranking_metrics(evaluation)
+    if mode == "validation":
+        mode = "quick"  # Existing training runs retain the quick tag.
     columns = [
         "run_id", "start_time", "tags.model_family", "tags.preprocessing_variant",
-        "tags.mode", METRIC, "metrics.val_pr_auc", "metrics.val_roc_auc",
+        "tags.mode", "tags.evaluation_protocol", metric, pr_auc, roc_auc,
         "params.config_sha256", "params.data_version",
         "tags.training_execution_id", "tags.candidate_index",
     ]
-    if runs.empty or METRIC not in runs.columns:
+    if runs.empty or metric not in runs.columns:
         return pd.DataFrame(columns=columns)
 
     result = runs.copy()
     if "status" in result.columns:
         result = result.loc[result["status"] == "FINISHED"]
+    # Failed holdout candidates can have a FINISHED MLflow lifecycle when
+    # training catches an exception after logging metrics; exclude them too.
+    if "tags.candidate_error" in result.columns:
+        error = result["tags.candidate_error"]
+        result = result.loc[error.isna() | error.astype(str).str.strip().eq("")]
+    if "tags.stage" in result.columns:
+        result = result.loc[~result["tags.stage"].eq("final_test").fillna(False)]
+    if "tags.evaluation_protocol" in result.columns:
+        protocol = result["tags.evaluation_protocol"]
+        # Older holdout records have no protocol tag. CV must be explicit.
+        mask = protocol.eq("cv") if evaluation == "cv" else (
+            protocol.isna() | protocol.eq("holdout")
+        )
+        result = result.loc[mask.fillna(False)]
+    elif evaluation == "cv":
+        return pd.DataFrame(columns=columns)
     for required in ("tags.model_family", "tags.preprocessing_variant"):
         if required not in result.columns:
             return pd.DataFrame(columns=columns)
@@ -99,12 +147,21 @@ def rank_candidates(
             return pd.DataFrame(columns=columns)
         result = result.loc[result["tags.training_execution_id"] == execution_id]
 
-    result[METRIC] = pd.to_numeric(result[METRIC], errors="coerce")
-    result = result.loc[result[METRIC].between(0, 1, inclusive="both")]
-    for tie_breaker in ("metrics.val_pr_auc", "metrics.val_roc_auc"):
+    result[metric] = pd.to_numeric(result[metric], errors="coerce")
+    result = result.loc[result[metric].between(0, 1, inclusive="both")]
+    for tie_breaker in (pr_auc, roc_auc):
         if tie_breaker not in result.columns:
             result[tie_breaker] = float("nan")
         result[tie_breaker] = pd.to_numeric(result[tie_breaker], errors="coerce")
+        valid = result[tie_breaker].between(0, 1, inclusive="both")
+        if evaluation == "cv":
+            # The CV engine always logs both tie-breakers; incomplete runs
+            # cannot be ranked consistently with the trainer.
+            result = result.loc[valid]
+        else:
+            result[tie_breaker] = result[tie_breaker].where(valid)
+    if evaluation == "cv" and not result.empty:
+        validate_cv_comparability(result)
 
     # train.py chooses the first candidate when all three metrics tie.
     # First means: YAML variant order, then candidate creation order.
@@ -123,7 +180,7 @@ def rank_candidates(
     if "run_id" not in result.columns:
         result["run_id"] = ""
     result = result.sort_values(
-        by=[METRIC, "metrics.val_pr_auc", "metrics.val_roc_auc",
+        by=[metric, pr_auc, roc_auc,
             "_variant_priority", "_candidate_priority", "start_time", "run_id"],
         ascending=[False, False, False, True, True, True, True],
         kind="stable",
@@ -136,21 +193,30 @@ def compare(
     *,
     config_path: Path,
     top: int = 10,
-    mode: str = "full",
+    mode: str | None = None,
     variant: str | None = None,
     execution_id: str | None = None,
     output: Path | None = None,
+    evaluation: str = "holdout",
 ) -> pd.DataFrame:
     """Query MLflow, display a leaderboard and optionally export it."""
+    metric, pr_auc, roc_auc = ranking_metrics(evaluation)
+    mode = mode if mode is not None else ("quick" if evaluation == "cv" else "full")
+    if mode not in ("full", "quick", "validation", "all"):
+        raise ValueError("Invalid comparison mode.")
+    if evaluation == "cv" and mode == "full":
+        raise ValueError("CV comparisons require validation-only mode or all.")
     if top < 1:
         raise ValueError("--top must be at least 1")
     if execution_id is not None and not EXECUTION_ID_RE.fullmatch(execution_id):
         raise ValueError("--execution-id must be a 32-character lowercase hex ID")
     experiment_name, db_path, variant_order = load_settings(config_path)
+    if variant is not None and variant not in variant_order:
+        raise ValueError(f"Unknown preprocessing variant: {variant}.")
     if not db_path.is_file():
         raise FileNotFoundError(
             f"MLflow tracking database not found: {db_path}. "
-            "Run training first (python -m src.models.train)."
+            "Run training first (python -m src.models.train --quick)."
         )
     mlflow.set_tracking_uri(f"sqlite:///{db_path.as_posix()}")
     experiment = mlflow.get_experiment_by_name(experiment_name)
@@ -167,24 +233,33 @@ def compare(
         variant=variant,
         execution_id=execution_id,
         variant_order=variant_order,
+        evaluation=evaluation,
     )
     if ranked.empty:
-        raise ValueError("No completed training candidates with valid validation F1 were found.")
+        raise ValueError(f"No completed {evaluation} training candidates with valid F1 were found.")
+
+    # MLflow returns columns from both protocols in a shared experiment.
+    # Keep the exported leaderboard specific to the selected protocol.
+    other_prefix = "metrics.val_" if evaluation == "cv" else "metrics.cv_"
+    ranked = ranked.drop(columns=[c for c in ranked.columns if c.startswith(other_prefix)])
 
     display_columns = [
         "run_id", "tags.model_family", "tags.preprocessing_variant",
-        "tags.mode", METRIC, "metrics.val_pr_auc", "metrics.val_roc_auc",
+        "tags.mode", metric, pr_auc, roc_auc,
+        "metrics.cv_f1_std",
         "params.config_sha256", "params.data_version",
         "tags.training_execution_id",
     ]
     display_columns = [col for col in display_columns if col in ranked.columns]
     print(f"Experiment: {experiment_name}")
     print(f"Tracking DB: {db_path}")
+    print(f"Evaluation protocol: {evaluation}")
     print(f"Valid candidates: {len(ranked)}")
     if execution_id is not None:
         print(f"Execution ID: {execution_id}")
     print(f"Best run: {ranked.iloc[0]['run_id']}")
-    print(f"Best validation F1: {ranked.iloc[0][METRIC]:.4f}")
+    label = "mean CV F1" if evaluation == "cv" else "validation F1"
+    print(f"Best {label}: {ranked.iloc[0][metric]:.4f}")
     print("\nLeaderboard:")
     print(ranked.loc[:, display_columns].head(top).to_string(index=False))
 
@@ -207,17 +282,19 @@ def compare(
 
 
 def main() -> int:
+    """Parse comparison arguments and report failures through the CLI."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs/config.yml")
     parser.add_argument("--top", type=int, default=10, help="Number of rows to display")
     parser.add_argument(
-        "--mode", choices=("full", "quick", "all"), default="full",
-        help="Training runs to compare (default: full; quick is only a smoke check)",
+        "--mode", choices=("full", "quick", "validation", "all"), default=None,
+        help="Lifecycle filter (default: full for holdout, validation for CV)",
     )
-    parser.add_argument("--variant", choices=("baseline", "robust", "interactions"))
+    parser.add_argument("--evaluation", choices=("holdout", "cv"), default="holdout")
+    parser.add_argument("--variant", help="Preprocessing variant defined in YAML")
     parser.add_argument(
         "--execution-id", type=str,
-        help="Limit comparison to one full training execution (32 hex characters)",
+        help="Limit comparison to one training execution (32 hex characters)",
     )
     parser.add_argument("--output", type=Path, help="Optional CSV leaderboard output")
     args = parser.parse_args()
@@ -229,6 +306,7 @@ def main() -> int:
             variant=args.variant,
             execution_id=args.execution_id,
             output=args.output,
+            evaluation=args.evaluation,
         )
     except (FileNotFoundError, ValueError, OSError) as exc:
         parser.exit(1, f"ERROR: {exc}\n")
