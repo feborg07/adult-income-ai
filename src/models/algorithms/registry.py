@@ -1,16 +1,20 @@
 """Explicit registration and lookup of algorithm plugins."""
 
 from .base import BaseAlgorithm
-from .extra_trees import ExtraTreesAlgorithm
-from .hist_gradient_boosting import HistGradientBoostingAlgorithm
 from .logistic_regression import LogisticRegressionAlgorithm
 from .random_forest import RandomForestAlgorithm
+from .extra_trees import ExtraTreesAlgorithm
+from .hist_gradient_boosting import HistGradientBoostingAlgorithm
+from .xgboost import XGBoostAlgorithm
+from .catboost import CatBoostAlgorithm
+from .lightgbm import LightGBMAlgorithm
 
 
 class AlgorithmRegistry:
     """Map YAML algorithm identifiers to reusable plugin instances."""
 
     def __init__(self) -> None:
+        """Initialize an empty registry."""
         self._plugins: dict[str, BaseAlgorithm] = {}
 
     def register(self, plugin: BaseAlgorithm) -> None:
@@ -21,6 +25,7 @@ class AlgorithmRegistry:
         name = getattr(plugin, "name", None)
         tasks = getattr(plugin, "supported_tasks", None)
 
+        # Validate plugin metadata before changing the registry.
         if not isinstance(name, str) or not name or name != name.strip():
             raise ValueError("Plugin must declare a valid name.")
 
@@ -53,10 +58,7 @@ class AlgorithmRegistry:
         return tuple(self._plugins)
 
 
-# Production plugins will be registered explicitly during migration.
-ALGORITHM_REGISTRY = AlgorithmRegistry()
-
-# Explicitly register production algorithm plugins.
+# Keep existing family order and append new production plugins.
 ALGORITHM_REGISTRY = AlgorithmRegistry()
 
 for plugin in (
@@ -64,5 +66,8 @@ for plugin in (
     RandomForestAlgorithm(),
     HistGradientBoostingAlgorithm(),
     ExtraTreesAlgorithm(),
+    XGBoostAlgorithm(),
+    CatBoostAlgorithm(),
+    LightGBMAlgorithm(),
 ):
     ALGORITHM_REGISTRY.register(plugin)

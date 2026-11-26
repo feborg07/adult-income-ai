@@ -523,10 +523,11 @@ def test_yaml_loader_reads_supplied_file(tmp_path):
     loaded = training.load_training_config(path)
     assert loaded["seed"] == 99
     specs = training.candidates(quick=True, config=loaded)
-    assert all(
-        (model.steps[-1][1] if isinstance(model, Pipeline) else model).random_state == 99
-        for _family, _params, model in specs
-    )
+    # Check the configured seed through each estimator's parameter API.
+    for family, _params, model in specs:
+        estimator = model.steps[-1][1] if isinstance(model, Pipeline) else model
+        seed_key = "random_seed" if family == "catboost" else "random_state"
+        assert estimator.get_params()[seed_key] == 99, family
 
 
 def test_yaml_loader_rejects_invalid_selection_metric(tmp_path):

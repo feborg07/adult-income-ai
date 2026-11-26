@@ -41,3 +41,49 @@ models:
     grid:
       max_depth: [null, 15]
       min_samples_leaf: [1, 5]
+  # CPU-only boosting candidates; keep the existing processed features.
+  xgboost:
+    fixed:
+      objective: binary:logistic
+      eval_metric: logloss
+      tree_method: hist
+      device: cpu
+      n_jobs: 4
+      verbosity: 0
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_lambda: 1.0
+    grid:
+      n_estimators: [200, 500]
+      max_depth: [3, 6]
+      learning_rate: [0.03, 0.1]
+  catboost:
+    fixed:
+      loss_function: Logloss
+      task_type: CPU
+      thread_count: 4
+      verbose: false
+      allow_writing_files: false
+      l2_leaf_reg: 3.0
+    grid:
+      iterations: [200, 500]
+      depth: [4, 6]
+      learning_rate: [0.03, 0.1]
+  lightgbm:
+    fixed:
+      objective: binary
+      boosting_type: gbdt
+      device_type: cpu
+      n_jobs: 4
+      verbosity: -1
+      deterministic: true
+      force_col_wise: true
+      min_child_samples: 20
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.8
+      reg_lambda: 1.0
+    grid:
+      n_estimators: [200, 500]
+      num_leaves: [15, 31]
+      learning_rate: [0.03, 0.1]
