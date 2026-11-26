@@ -31,6 +31,10 @@ CV_COMPARISON_PARAMS = (
     "params.data_version", "params.seed", "params.n_splits",
     "params.calibration_size", "params.threshold_policy",
 )
+CV_REPRESENTATION_PARAMS = (
+    "params.representation", "params.excluded_features", "params.grouping_excluded_features",
+    "params.grouping_policy", "params.fold_sha256",
+)
 EXECUTION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -73,7 +77,11 @@ def ranking_metrics(evaluation: str) -> tuple[str, str, str]:
 
 def validate_cv_comparability(runs: pd.DataFrame) -> None:
     """Reject missing or incompatible CV data, seed, split or threshold settings."""
-    for column in CV_COMPARISON_PARAMS:
+    # Historical-only comparisons remain supported, but do not mix old and new runs.
+    has_identity = any(column in runs and runs[column].notna().any()
+                       for column in CV_REPRESENTATION_PARAMS)
+    columns = CV_COMPARISON_PARAMS + (CV_REPRESENTATION_PARAMS if has_identity else ())
+    for column in columns:
         if column not in runs or runs[column].isna().any():
             raise ValueError(f"Missing CV comparison metadata: {column}.")
         values = runs[column].astype(str).str.strip()

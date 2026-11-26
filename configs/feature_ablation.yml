@@ -1,0 +1,18 @@
+# Paired, fixed-hyperparameter experiments; no held-out data or promotion.
+representations:
+  control: []
+  no_fnlwgt: [fnlwgt]
+  no_fnlwgt_race: [fnlwgt, race]
+  no_fnlwgt_sex: [fnlwgt, sex]
+  no_fnlwgt_demographics: [fnlwgt, race, sex]
+candidates:
+  hgb_cv_record:
+    family: hist_gradient_boosting
+    variant: baseline
+    parameters: {max_iter: 150, learning_rate: 0.05, max_leaf_nodes: 31}
+    historical_cv_f1: 0.7256365851209653
+  lightgbm_pilot_record:
+    family: lightgbm
+    variant: interactions
+    parameters: {boosting_type: gbdt, class_weight: null, colsample_bytree: 0.8, deterministic: true, device_type: cpu, force_col_wise: true, learning_rate: 0.03, min_child_samples: 20, n_estimators: 500, n_jobs: 4, num_leaves: 15, objective: binary, reg_alpha: 0.0, reg_lambda: 1.0, subsample: 0.8, subsample_freq: 1, verbosity: -1}
+    historical_cv_f1: 0.7249885124596355

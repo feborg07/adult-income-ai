@@ -64,16 +64,19 @@ def prepare_cv_folds(
     n_splits: int = 3,
     calibration_size: float = 0.20,
     random_state: int = 42,
+    grouping_excluded_features: tuple[str, ...] = (),
 ) -> tuple[PreparedFold, ...]:
     """Fit fresh preprocessors on fold fit rows and transform all three subsets.
 
     Pass only the original raw training partition. The resulting matrices may
     be reused across candidates with identical preprocessing and fold settings.
     Neither the original validation partition nor the test partition is needed.
+    Grouping exclusions affect partition membership only; preprocessing still
+    uses the supplied candidate configuration.
     """
     indices = create_cv_folds(
         X, y, n_splits=n_splits, calibration_size=calibration_size,
-        random_state=random_state,
+        random_state=random_state, grouping_excluded_features=grouping_excluded_features,
     )
     folds = []
     for number, (fit, calibration, scoring) in enumerate(indices, start=1):

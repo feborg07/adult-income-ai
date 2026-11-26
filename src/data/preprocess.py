@@ -125,6 +125,9 @@ TARGET_MAPPING = {
 
 FEATURE_COLUMNS = NUMERICAL_FEATURES + CATEGORICAL_FEATURES
 
+# Only the approved ablation candidates have no engineered-feature dependencies.
+ABLATION_FEATURES = ("fnlwgt", "race", "sex")
+
 CAPITAL_COLUMNS = [
     "capital-gain",
     "capital-loss",
@@ -168,6 +171,18 @@ def _check_choice(name: str, value, choices: tuple[str, ...]) -> None:
         options = ", ".join(quoted[:-1]) + ", or " + quoted[-1]
 
     raise ValueError(f"{name} must be {options}.")
+
+
+def _normalize_excluded_features(value) -> tuple[str, ...]:
+    """Validate approved raw exclusions and normalize their order for reproducibility."""
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("excluded_features must be a tuple or list of feature names.")
+    if any(not isinstance(name, str) or name not in ABLATION_FEATURES for name in value):
+        raise ValueError(f"excluded_features must contain only {ABLATION_FEATURES}.")
+    if len(set(value)) != len(value):
+        raise ValueError("excluded_features must not contain duplicate names.")
+    # Canonical order ensures equivalent sets yield the same configuration.
+    return tuple(name for name in ABLATION_FEATURES if name in value)
 
 
 @dataclass(frozen=True)
@@ -223,6 +238,10 @@ class PreprocessingConfig:
 
     random_state:
         Random seed used for reproducibility.
+
+    excluded_features:
+        Approved raw predictors omitted from model inputs. Full raw rows
+        are still used for duplicate-aware partitioning.
     """
 
     categorical_imputation: str = "constant"
@@ -245,6 +264,7 @@ class PreprocessingConfig:
     test_size: float = TEST_SIZE
     validation_size: float = 0.20  # Fraction of the development (non-test) partition.
     random_state: int = RANDOM_STATE
+    excluded_features: tuple[str, ...] = ()
 
     def __post_init__(self):
         """
@@ -318,6 +338,9 @@ class PreprocessingConfig:
                 "random_state must be an integer between 0 and "
                 "2**32 - 1, excluding bool."
             )
+
+        # JSON arrays are accepted and converted to the immutable canonical tuple.
+        object.__setattr__(self, "excluded_features", _normalize_excluded_features(self.excluded_features))
 
         # Normalize NumPy scalar values for JSON serialization.
         object.__setattr__(self, "random_state", int(self.random_state))
@@ -719,11 +742,15 @@ def create_cv_folds(
     n_splits: int = 3,
     calibration_size: float = 0.20,
     random_state: int = RANDOM_STATE,
+    *,
+    grouping_excluded_features: tuple[str, ...] = (),
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Return positional fit, calibration and scoring indices for each CV fold.
 
     Only pass the original untransformed training partition. Complete predictor
-    vectors define groups even when duplicate observations have different labels.
+    vectors define groups by default, even when duplicate observations have different labels.
+    Optional grouping exclusions define a common reduced raw representation for
+    all candidates without changing their model inputs or the saved partitions.
     The inner calibration fraction is relative to the outer training subset.
     No learned preprocessing or estimator fitting is performed here.
     """
@@ -740,7 +767,9 @@ def create_cv_folds(
     config = PreprocessingConfig(test_size=calibration_size, random_state=random_state)
     X_pos = X.reset_index(drop=True)
     y_pos = y.reset_index(drop=True)
-    groups = predictor_group_ids(X_pos)
+    excluded = _normalize_excluded_features(grouping_excluded_features)
+    grouping_frame = X_pos.drop(columns=list(excluded))
+    groups = predictor_group_ids(grouping_frame)
     if any(len(np.unique(groups[y_pos.to_numpy() == label])) < n_splits for label in (0, 1)):
         raise ValueError("Too few distinct predictor groups per class for the requested folds.")
 
@@ -749,9 +778,9 @@ def create_cv_folds(
     )
     folds = []
     for outer_train, scoring in splitter.split(X_pos, y_pos, groups):
-        # Reserve calibration rows from the outer training subset only.
+        # Use the same reduced grouping basis for inner and outer splits.
         X_fit, X_cal, _, _ = create_train_test_split(
-            X_pos.iloc[outer_train], y_pos.iloc[outer_train],
+            grouping_frame.iloc[outer_train], y_pos.iloc[outer_train],
             test_size=config.test_size, random_state=config.random_state,
             duplicate_aware=True,
         )
@@ -807,7 +836,13 @@ class AdultFeatureEngineer(
 
     interaction_features:
         Whether to create selected interaction features.
+
+    excluded_features:
+        Approved raw predictors to discard before feature engineering.
     """
+
+    # Fallback for fitted reference artifacts serialized before this parameter existed.
+    excluded_features = ()
 
     def __init__(
         self,
@@ -815,6 +850,7 @@ class AdultFeatureEngineer(
         capital_indicators=True,
         education_representation="education-num",
         interaction_features=False,
+        excluded_features=(),
     ):
 
         """Initialize the configurable Adult Income feature transformations."""
@@ -827,6 +863,9 @@ class AdultFeatureEngineer(
 
         self.interaction_features = interaction_features
 
+        # Keep the constructor argument unchanged for sklearn.clone.
+        self.excluded_features = excluded_features
+
     def fit(self, X, y=None):
         """
         Validate input columns and record input schema.
@@ -835,7 +874,8 @@ class AdultFeatureEngineer(
         if not isinstance(X, pd.DataFrame):
             raise TypeError("AdultFeatureEngineer requires a DataFrame.")
 
-        missing = set(FEATURE_COLUMNS) - set(X.columns)
+        excluded = _normalize_excluded_features(self.excluded_features)
+        missing = set(FEATURE_COLUMNS) - set(excluded) - set(X.columns)
 
         if missing:
             raise ValueError(f"Missing input features: {sorted(missing)}")
@@ -846,6 +886,11 @@ class AdultFeatureEngineer(
         )
 
         self.n_features_in_ = X.shape[1]
+
+        # Preserve sklearn fitted-input metadata separately from the inference schema.
+        self.required_features_ = np.asarray(
+            [name for name in self.feature_names_in_ if name not in excluded], dtype=object
+        )
 
         # Derive names from the actual transformation, preserving column order.
         self.output_features_ = np.asarray(
@@ -874,7 +919,9 @@ class AdultFeatureEngineer(
         if not isinstance(X, pd.DataFrame):
             raise TypeError("AdultFeatureEngineer requires a DataFrame.")
 
-        missing = set(self.feature_names_in_) - set(X.columns)
+        # Legacy fitted artifacts have only feature_names_in_.
+        required = getattr(self, "required_features_", self.feature_names_in_)
+        missing = set(required) - set(X.columns)
 
         if missing:
             raise ValueError(f"Missing input features: {sorted(missing)}")
@@ -883,7 +930,8 @@ class AdultFeatureEngineer(
 
     def _transform_frame(self, X):
         """Build a DataFrame without invoking scikit-learn output wrapping."""
-        transformed = X.loc[:, self.feature_names_in_].copy(deep=True)
+        required = getattr(self, "required_features_", self.feature_names_in_)
+        transformed = X.loc[:, required].copy(deep=True)
 
         # ----------------------------------------------------
         # Capital gain/loss feature engineering
@@ -1047,9 +1095,10 @@ def get_feature_groups(
     EDA-driven feature engineering.
     """
 
-    numerical = NUMERICAL_FEATURES.copy()
+    # Exclusions apply to model inputs, not raw dataset grouping.
+    numerical = [name for name in NUMERICAL_FEATURES if name not in config.excluded_features]
 
-    categorical = CATEGORICAL_FEATURES.copy()
+    categorical = [name for name in CATEGORICAL_FEATURES if name not in config.excluded_features]
 
     # Education representation.
     if config.education_representation == "education-num":
@@ -1230,6 +1279,7 @@ def build_preprocessor(
                 capital_indicators=config.capital_indicators,
                 education_representation=(config.education_representation),
                 interaction_features=config.interaction_features,
+                excluded_features=config.excluded_features,
             ),
         )
     ]

@@ -1291,7 +1291,8 @@ class TestArtifactSerialization:
         with config_path.open("r", encoding="utf-8") as file:
             saved = json.load(file)
 
-        assert saved == asdict(default_config)
+        # JSON represents immutable tuple fields as arrays.
+        assert saved == json.loads(json.dumps(asdict(default_config)))
 
 
 # ============================================================

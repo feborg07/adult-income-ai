@@ -6,6 +6,9 @@
 seed: 42
 variants: [baseline, robust, interactions]
 selection_metric: val_f1  # Existing holdout ranking; CV ranks by mean cv_f1.
+# CV only: representation A retains race and sex; holdout unchanged.
+# Options: control, no_fnlwgt, no_fnlwgt_race, no_fnlwgt_sex, no_fnlwgt_demographics.
+cv_representation: no_fnlwgt
 cross_validation:
   n_splits: 3
   calibration_size: 0.20  # Fraction of each outer fold training subset.

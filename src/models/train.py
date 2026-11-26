@@ -52,7 +52,7 @@ import uuid
 import tempfile
 import warnings
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import product
 from pathlib import Path
 
@@ -72,7 +72,9 @@ from .algorithms.registry import ALGORITHM_REGISTRY
 from .tasks import binary_classification as binary_task
 from . import cross_validation as cv
 from .search.configuration import validate_optuna_config
-from src.data.preprocess import PreprocessingConfig, load_untransformed_partition
+from src.data.preprocess import (
+    PreprocessingConfig, create_cv_folds, load_untransformed_partition,
+)
 
 # Preserve the existing public evaluation functions for callers and tests.
 from .tasks.binary_classification import evaluate, optimal_threshold, rank
@@ -271,6 +273,30 @@ def resolve_cv_settings(config: dict, args=None) -> dict:
     return settings
 
 
+def resolve_cv_representation(config: dict) -> dict:
+    """Resolve the CV-only input policy without changing saved holdout artifacts.
+
+    Old YAML files without a policy retain the original full-input protocol.
+    The selected policy reproduces the common grouping basis of the ablation.
+    """
+    name = config.get("cv_representation", "control")
+    if name == "control":
+        return {"representation": name, "excluded_features": (),
+                "grouping_excluded_features": (), "grouping_policy": "full_raw_predictors_v1"}
+    # Keep the same conservative grouping basis across reduced representations.
+    policies = {
+        "no_fnlwgt": ("fnlwgt",),
+        "no_fnlwgt_race": ("fnlwgt", "race"),
+        "no_fnlwgt_sex": ("fnlwgt", "sex"),
+        "no_fnlwgt_demographics": ("fnlwgt", "race", "sex"),
+    }
+    if isinstance(name, str) and name in policies:
+        return {"representation": name, "excluded_features": policies[name],
+                "grouping_excluded_features": ("fnlwgt", "race", "sex"),
+                "grouping_policy": "common_retained_raw_predictors_v1"}
+    raise ValueError("cv_representation must be one of: control, " + ", ".join(policies))
+
+
 def load_training_config(path: Path | None = None) -> dict:
     """Load and validate YAML settings before starting any training."""
     path = Path(path) if path is not None else ROOT / "configs/config.yml"
@@ -318,6 +344,7 @@ def load_training_config(path: Path | None = None) -> dict:
     if not isinstance(config["mlflow"].get("experiment"), str):
         raise ValueError("mlflow.experiment must be a string.")
     config["cross_validation"] = resolve_cv_settings(config)
+    resolve_cv_representation(config)
     validate_optuna_config(config)
     return config
 
@@ -659,6 +686,8 @@ def write_cv_leaderboard(path: Path, rows: list[dict]) -> None:
     frame = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
         "run_id", "variant", "model", "parameters", *ranking, "cv_f1_std", "status",
         "optuna_study_name", "optuna_trial_number", "training_execution_id",
+        "representation", "excluded_features", "grouping_excluded_features",
+        "grouping_policy", "fold_sha256", "effective_preprocessing_sha256",
     ])
     frame.sort_values(ranking, ascending=False, kind="stable").to_csv(path, index=False)
 
@@ -702,19 +731,41 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
     calibration_size = cv_settings["calibration_size"]
     config_hashes = {variant: file_sha256(processed / variant / "preprocessing_config.json")
                      for variant in scope["variants"]}
+    representation = resolve_cv_representation(config)
+    grouping = representation["grouping_excluded_features"]
+    excluded = representation["excluded_features"]
+    X, y = load_untransformed_partition(processed / scope["variants"][0], "train")
+    # Establish a shared partition identity before preparing any candidate.
+    fold_settings = {**cv_settings, "random_state": config["seed"],
+                     "grouping_excluded_features": grouping}
+    indices = create_cv_folds(X, y, **fold_settings)
+    fold_hash = hashlib.sha256(json.dumps(
+        [[part.tolist() for part in fold] for fold in indices]).encode()).hexdigest()
+    identity = {**representation, "fold_sha256": fold_hash}
+    base_configs = {variant: PreprocessingConfig(**json.loads(
+        (processed / variant / "preprocessing_config.json").read_text(encoding="utf-8")))
+        for variant in scope["variants"]}
+    if any(c.excluded_features for c in base_configs.values()):
+        raise ValueError("CV requires original full-input preprocessing configurations.")
+    effective_configs = {variant: replace(base, excluded_features=excluded)
+                         for variant, base in base_configs.items()}
+    effective_hashes = {variant: hashlib.sha256(json.dumps(
+        asdict(c), sort_keys=True).encode()).hexdigest() for variant, c in effective_configs.items()}
+    metadata = {key: json.dumps(value) if isinstance(value, tuple) else value
+                for key, value in identity.items()}
     prepared = {}
 
     def get_folds(variant):
-        """Prepare each selected representation only when first requested."""
+        """Prepare and verify each representation against the shared row assignments."""
         if variant not in prepared:
-            folder = processed / variant
-            preprocess_config = PreprocessingConfig(**json.loads(
-                (folder / "preprocessing_config.json").read_text(encoding="utf-8")))
-            X, y = load_untransformed_partition(folder, "train")
-            prepared[variant] = cv.prepare_cv_folds(
-                X, y, preprocess_config, n_splits=n_splits,
-                calibration_size=calibration_size, random_state=config["seed"],
-            )
+            folds = cv.prepare_cv_folds(X, y, effective_configs[variant], **fold_settings)
+            if len(folds) != len(indices):
+                raise RuntimeError("Prepared fold count changed.")
+            for fold, parts in zip(folds, indices):
+                for actual, part in zip((fold.X_fit, fold.X_calibration, fold.X_scoring), parts):
+                    if not actual.index.equals(X.iloc[part].index):
+                        raise RuntimeError("Prepared fold membership changed.")
+            prepared[variant] = folds
         return prepared[variant]
 
     def evaluate_candidate(variant, family, params, prototype, trial=None):
@@ -744,6 +795,7 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
                 "seed": config["seed"], "n_splits": n_splits,
                 "calibration_size": calibration_size, "search_strategy": scope["search"],
                 "threshold_policy": "fold_fit_inner_calibration",
+                **metadata, "effective_preprocessing_sha256": effective_hashes[variant],
                 **{f"fixed_{k}": str(v) for k, v in fixed.items()},
                 **{f"model_{k}": str(v) for k, v in params.items()},
             })
@@ -758,6 +810,7 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
             row = {
                 "run_id": run.info.run_id, "variant": variant, "model": family,
                 "parameters": json.dumps(params, sort_keys=True),
+                **metadata, "effective_preprocessing_sha256": effective_hashes[variant],
                 **metrics, "convergence_warning_count": warning_count, "status": "FINISHED",
             }
             if trial is not None:
@@ -788,6 +841,7 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
         storage_uri = f"sqlite:///{study_db.as_posix()}"
         context_details = {
             "raw_training": raw_hash, "preprocessing": config_hashes,
+            "effective_preprocessing": effective_hashes, "representation": identity,
             "variants": scope["variants"], "cv": cv_settings, "seed": config["seed"],
             "code": optimization_code_identity(), "tracking": tracking_identity,
             "config_sha256": config_sha256,
@@ -846,7 +900,8 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
         "raw_training_sha256": raw_hash, "git_commit": revision, "n_splits": n_splits,
         "calibration_size": calibration_size, "candidate_count": len(rows),
         "successful_candidates": len(rows), "preferred_variant_by_cv": preferred,
-        "winners": winners,
+        "winners": winners, **identity,
+        "effective_preprocessing_sha256": effective_hashes,
     }
     if studies:
         # The Optuna best trial uses F1 alone; our leaderboard retains metric tie-breakers.

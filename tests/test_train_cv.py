@@ -26,6 +26,8 @@ def cv_workspace(tmp_path, sample_adult_df):
     for number in range(12):
         batch = sample_adult_df.copy()
         batch["fnlwgt"] += number * 1_000_000
+        # Keep groups distinct even when census weight and demographics are excluded.
+        batch["age"] += number
         batches.append(batch)
     X, y = split_features_target(encode_target(pd.concat(batches, ignore_index=True)))
     args = Namespace(
@@ -35,11 +37,13 @@ def cv_workspace(tmp_path, sample_adult_df):
         quick=True, evaluation="cv", models=["logistic_regression"],
         variants=["baseline"], search="first",
     )
-    for variant in ("baseline", "interactions"):
+    for variant in ("baseline", "robust", "interactions"):
         folder = args.processed_dir / variant
         folder.mkdir(parents=True)
         X.assign(income=y).to_csv(folder / "raw_train.csv", index=False)
-        save_config(PreprocessingConfig(interaction_features=variant == "interactions"),
+        save_config(PreprocessingConfig(interaction_features=variant == "interactions",
+                                        numerical_scaling="robust" if variant == "robust" else "standard",
+                                        capital_transform="both" if variant == "robust" else "log1p"),
                     folder / "preprocessing_config.json")
     reference = tmp_path / "models/reference/best_model_pipeline.joblib"
     reference.parent.mkdir(parents=True)
