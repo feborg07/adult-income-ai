@@ -1,6 +1,10 @@
 """Explicit registration and lookup of algorithm plugins."""
 
 from .base import BaseAlgorithm
+from .extra_trees import ExtraTreesAlgorithm
+from .hist_gradient_boosting import HistGradientBoostingAlgorithm
+from .logistic_regression import LogisticRegressionAlgorithm
+from .random_forest import RandomForestAlgorithm
 
 
 class AlgorithmRegistry:
@@ -51,3 +55,14 @@ class AlgorithmRegistry:
 
 # Production plugins will be registered explicitly during migration.
 ALGORITHM_REGISTRY = AlgorithmRegistry()
+
+# Explicitly register production algorithm plugins.
+ALGORITHM_REGISTRY = AlgorithmRegistry()
+
+for plugin in (
+    LogisticRegressionAlgorithm(),
+    RandomForestAlgorithm(),
+    HistGradientBoostingAlgorithm(),
+    ExtraTreesAlgorithm(),
+):
+    ALGORITHM_REGISTRY.register(plugin)

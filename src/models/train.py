@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Module: src/models/train.py
 
 Train machine learning classifiers using previously saved
@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from importlib.metadata import version as package_version
 import json
 import logging
 import subprocess
@@ -54,34 +53,21 @@ from pathlib import Path
 
 import joblib
 import mlflow
-import mlflow.sklearn
 import yaml
 import numpy as np
 import pandas as pd
 
 from sklearn.base import clone
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.ensemble import (
-    ExtraTreesClassifier,
-    HistGradientBoostingClassifier,
-    RandomForestClassifier,
-)
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-    precision_recall_curve,
-)
-from sklearn.pipeline import Pipeline, make_pipeline
-from sklearn.preprocessing import (
-    FunctionTransformer,
-    StandardScaler,
-)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer
+
+from .algorithms.base import BINARY_CLASSIFICATION
+from .algorithms.registry import ALGORITHM_REGISTRY
+from .tasks import binary_classification as binary_task
+
+# Preserve the existing public evaluation functions for callers and tests.
+from .tasks.binary_classification import evaluate, optimal_threshold, rank
 
 
 # ============================================================
@@ -98,15 +84,7 @@ VARIANTS = (
     "interactions",
 )
 
-SEED = 42
 
-# Single registry of supported classifier families.
-MODEL_REGISTRY = {
-    "logistic_regression": LogisticRegression,
-    "random_forest": RandomForestClassifier,
-    "hist_gradient_boosting": HistGradientBoostingClassifier,
-    "extra_trees": ExtraTreesClassifier,
-}
 
 
 # ============================================================
@@ -199,17 +177,10 @@ def load_variant(
                 f"Non-finite features: {variant}/{split}"
             )
 
-        if (
-            y.isna().any()
-            or not set(y.unique()).issubset({0, 1})
-        ):
-            raise ValueError(
-                f"Target must contain only 0/1: {variant}/{split}"
-            )
-
+        # Delegate target validation to the binary classification task.
         matrices[split] = (
             X,
-            y.astype(int),
+            binary_task.validate_target(y, f"{variant}/{split}"),
         )
 
     # Validate consistent feature columns and ordering.
@@ -227,10 +198,9 @@ def load_variant(
     # Training and validation require both classes.
     for split in ("train", "val"):
 
-        if set(matrices[split][1].unique()) != {0, 1}:
-            raise ValueError(
-                f"Both target classes required: {variant}/{split}"
-            )
+        binary_task.require_both_classes(
+            matrices[split][1], f"{variant}/{split}"
+        )
 
     preprocessor_path = (
         preprocessor_dir / f"{variant}.joblib"
@@ -278,10 +248,12 @@ def load_training_config(path: Path | None = None) -> dict:
         raise ValueError("Duplicate preprocessing variants are not allowed.")
     if not isinstance(config["models"], dict) or not config["models"]:
         raise ValueError("models must be a nonempty mapping.")
-    unsupported = set(config["models"]) - MODEL_REGISTRY.keys()
+    unsupported = set(config["models"]) - set(ALGORITHM_REGISTRY.names())
     if unsupported:
         raise ValueError(f"Unsupported model families: {sorted(unsupported)}")
     for name, spec in config["models"].items():
+        # Reject algorithms that do not support the current prediction task.
+        ALGORITHM_REGISTRY.get(name, task_type=BINARY_CLASSIFICATION)
         if not isinstance(spec, dict) or not isinstance(spec.get("fixed"), dict):
             raise ValueError(f"{name}: fixed must be a mapping.")
         grid = spec.get("grid")
@@ -341,16 +313,16 @@ def candidates(quick: bool = False, config: dict | None = None):
     seed = config["seed"]
     specs = []
     for family, spec in config["models"].items():
+        plugin = ALGORITHM_REGISTRY.get(
+            family, task_type=BINARY_CLASSIFICATION
+        )
         grid = spec["grid"]
         keys = list(grid)
         combinations = product(*(grid[key] for key in keys))
         for values in combinations:
             params = dict(zip(keys, values))
-            estimator = MODEL_REGISTRY[family](
-                **spec["fixed"], **params, random_state=seed
-            )
-            if family == "logistic_regression":
-                estimator = make_pipeline(StandardScaler(), estimator)
+            # The plugin owns estimator construction, not the engine.
+            estimator = plugin.build({**spec["fixed"], **params}, seed)
             specs.append((family, params, estimator))
             if quick:
                 break  # One configuration per family, preserving YAML order.
@@ -358,110 +330,7 @@ def candidates(quick: bool = False, config: dict | None = None):
 
 
 # ============================================================
-# 5. Decision threshold optimization
-# ============================================================
-
-def optimal_threshold(
-    y: pd.Series,
-    probabilities: np.ndarray,
-) -> float:
-    """
-    Find the threshold maximizing validation F1.
-
-    The test set is never used for threshold optimization.
-    """
-
-    precision, recall, thresholds = (
-        precision_recall_curve(y, probabilities)
-    )
-
-    if not len(thresholds):
-        return 0.5
-
-    f1 = (
-        2 * precision[:-1] * recall[:-1]
-        / np.maximum(
-            precision[:-1] + recall[:-1],
-            1e-15,
-        )
-    )
-
-    return float(
-        thresholds[int(np.argmax(f1))]
-    )
-
-
-# ============================================================
-# 6. Model evaluation
-# ============================================================
-
-def evaluate(
-    y: pd.Series,
-    probabilities: np.ndarray,
-    threshold: float,
-) -> dict:
-    """Calculate metrics using a fixed decision threshold."""
-
-    predictions = (
-        probabilities >= threshold
-    ).astype(int)
-
-    cm = confusion_matrix(
-        y,
-        predictions,
-        labels=[0, 1],
-    )
-
-    return {
-        "f1": float(
-            f1_score(y, predictions, zero_division=0)
-        ),
-        "precision": float(
-            precision_score(y, predictions, zero_division=0)
-        ),
-        "recall": float(
-            recall_score(y, predictions, zero_division=0)
-        ),
-        "accuracy": float(
-            accuracy_score(y, predictions)
-        ),
-        "pr_auc": (
-            float(average_precision_score(y, probabilities))
-            if y.nunique() == 2
-            else None
-        ),
-        "roc_auc": (
-            float(roc_auc_score(y, probabilities))
-            if y.nunique() == 2
-            else None
-        ),
-        "confusion_matrix": cm.tolist(),
-    }
-
-
-# ============================================================
-# 7. Validation ranking
-# ============================================================
-
-def rank(row: dict):
-    """
-    Rank candidates using validation metrics.
-
-    Priority:
-        1. F1
-        2. PR-AUC
-        3. ROC-AUC
-    """
-
-    return (
-        row["val_f1"],
-        row["val_pr_auc"],
-        row["val_roc_auc"],
-    )
-
-
-# ============================================================
-# 8. Artifact fingerprint
+# 5. Artifact fingerprint
 # ============================================================
 
 def file_sha256(path: Path) -> str:
@@ -548,7 +417,7 @@ def atomic_json_write(path: Path, payload: dict) -> None:
 
 
 # ============================================================
-# 9. MLflow configuration
+# 6. MLflow configuration
 # ============================================================
 
 def configure_mlflow(
@@ -590,7 +459,7 @@ def configure_mlflow(
 
 
 # ============================================================
-# 10. Deployable pipeline construction
+# 7. Deployable pipeline construction
 # ============================================================
 
 def build_deployable_pipeline(
@@ -649,7 +518,7 @@ def build_deployable_pipeline(
 
 
 # ============================================================
-# 11. Main training workflow
+# 8. Main training workflow
 # ============================================================
 
 def train(args):
@@ -829,11 +698,9 @@ def train(args):
                             convergence_warnings[0][:500],
                         )
 
-                    # Validation predictions.
-                    probabilities = (
-                        model.predict_proba(
-                            data.X_val
-                        )[:, 1]
+                    # Interpret predictions through the binary task module.
+                    probabilities = binary_task.positive_probabilities(
+                        model, data.X_val
                     )
 
                     threshold = optimal_threshold(
@@ -847,10 +714,8 @@ def train(args):
                         threshold,
                     )
 
-                    default_f1 = f1_score(
-                        data.y_val,
-                        probabilities >= 0.5,
-                        zero_division=0,
+                    default_f1 = binary_task.default_f1(
+                        data.y_val, probabilities
                     )
 
                     # Log validation metrics.
@@ -873,30 +738,10 @@ def train(args):
                         threshold,
                     )
 
-                    # Log models without scanning unrelated installed packages
-                    # (such as CUDA-enabled PyTorch) for dependencies.
-                    # Trust only these known sklearn tree types from our own
-                    # freshly trained models; never blindly trust external files.
-                    trusted_types = {
-                        "random_forest": ["sklearn.tree._tree.Tree"],
-                        "extra_trees": ["sklearn.tree._tree.Tree"],
-                        "hist_gradient_boosting": [
-                            "sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor"
-                        ],
-                    }.get(family, [])
-                    model_requirements = [
-                        f"{package}=={package_version(package)}"
-                        for package in (
-                            "scikit-learn", "numpy", "scipy", "pandas",
-                            "cloudpickle", "skops",
-                        )
-                    ]
-                    mlflow.sklearn.log_model(
-                        sk_model=model,
-                        name="model",
-                        skops_trusted_types=trusted_types,
-                        pip_requirements=model_requirements,
-                    )
+                    # The plugin owns native MLflow model serialization.
+                    ALGORITHM_REGISTRY.get(
+                        family, task_type=BINARY_CLASSIFICATION
+                    ).log_model(model)
 
                     row = {
                         "run_id": run.info.run_id,
@@ -1043,8 +888,8 @@ def train(args):
     ) in winners.items():
 
         # Quick mode is a smoke check only: training, validation and MLflow
-        # logging have already succeeded. Do not package any deployable
-        # pipeline or threshold, and never touch held-out test data.
+        # logging have already succeeded. Do not package a deployable
+        # pipeline or evaluate the held-out test partition.
         if args.quick:
             summary["winners"][variant] = {"validation": best}
             LOG.info(
@@ -1114,7 +959,7 @@ def train(args):
             json.dumps(
                 {
                     "threshold": best["optimal_threshold"],
-                    "positive_class": 1,
+                    "positive_class": binary_task.POSITIVE_CLASS,
                     "variant": variant,
                 },
                 indent=2,
@@ -1136,10 +981,8 @@ def train(args):
 
         if not args.quick:
 
-            test_probabilities = (
-                classifier.predict_proba(
-                    data.X_test
-                )[:, 1]
+            test_probabilities = binary_task.positive_probabilities(
+                classifier, data.X_test
             )
 
             test_metrics = evaluate(
@@ -1272,7 +1115,6 @@ def train(args):
         LOG.info("Saved candidate metadata: %s", candidate_metadata)
 
     # --------------------------------------------------------
-    # --------------------------------------------------------
     # Save training summary
     # --------------------------------------------------------
 
@@ -1302,10 +1144,11 @@ def train(args):
 
 
 # ============================================================
-# 12. Command-line arguments
+# 9. Command-line arguments
 # ============================================================
 
 def parse_args():
+    """Parse CLI options and resolve YAML-based defaults."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config", type=Path, default=ROOT / "configs/config.yml",
@@ -1322,7 +1165,7 @@ def parse_args():
         help="Development mode: validation only; never package a promotion candidate.",
     )
     parser.add_argument(
-        "--models", nargs="+", choices=tuple(MODEL_REGISTRY),
+        "--models", nargs="+", choices=ALGORITHM_REGISTRY.names(),
         help="Select model families enabled in the YAML configuration.",
     )
     parser.add_argument(
@@ -1351,10 +1194,11 @@ def parse_args():
 
 
 # ============================================================
-# 13. Entry point
+# 10. Entry point
 # ============================================================
 
 def main():
+    """Configure logging and run the requested training command."""
 
     logging.basicConfig(
         level=logging.INFO,
@@ -1377,7 +1221,19 @@ def main():
 
         return
 
-    train(args)
+    # Report the final execution status without hiding training errors.
+    mode = "Quick" if args.quick else "Full"
+    try:
+        train(args)
+    except Exception as exc:
+        LOG.error("%s Training Failed: %s", mode, exc)
+        raise  # Preserve the original traceback and nonzero CLI exit status.
+
+    if args.quick:
+        LOG.info("Quick Training Successful")
+    else:
+        # Full mode may complete with individual candidate failures.
+        LOG.info("Full Training Completed")
 
 
 if __name__ == "__main__":
