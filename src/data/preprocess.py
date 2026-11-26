@@ -62,7 +62,7 @@ import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
     OneHotEncoder,
@@ -550,6 +550,14 @@ def split_features_target(
 # ============================================================
 
 
+def predictor_group_ids(X: pd.DataFrame) -> np.ndarray:
+    """Assign identical complete predictor rows the same positional group ID."""
+    # Preserve the original splitter's grouping semantics, including missing values.
+    group_index = pd.MultiIndex.from_frame(X.reset_index(drop=True))
+    group_codes, _ = pd.factorize(group_index, sort=False)
+    return group_codes
+
+
 def create_train_test_split(
     X: pd.DataFrame,
     y: pd.Series,
@@ -614,12 +622,7 @@ def create_train_test_split(
     #
     # Missing values are treated as equivalent within
     # the grouping operation.
-    group_index = pd.MultiIndex.from_frame(X_reset)
-
-    group_codes, _ = pd.factorize(
-        group_index,
-        sort=False,
-    )
+    group_codes = predictor_group_ids(X_reset)
 
     # Construct a table linking each observation to
     # its feature-group ID and target label.
@@ -710,6 +713,69 @@ def create_train_val_test_split(
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
+def create_cv_folds(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_splits: int = 3,
+    calibration_size: float = 0.20,
+    random_state: int = RANDOM_STATE,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Return positional fit, calibration and scoring indices for each CV fold.
+
+    Only pass the original untransformed training partition. Complete predictor
+    vectors define groups even when duplicate observations have different labels.
+    The inner calibration fraction is relative to the outer training subset.
+    No learned preprocessing or estimator fitting is performed here.
+    """
+    if list(X.columns) != FEATURE_COLUMNS:
+        raise ValueError("CV requires the complete, ordered raw predictor columns.")
+    if len(X) != len(y) or not X.index.equals(y.index):
+        raise ValueError("X and y must have matching rows and indices.")
+    if y.isna().any() or set(y.unique()) != {0, 1}:
+        raise ValueError("CV requires both binary target classes (0 and 1).")
+    if isinstance(n_splits, bool) or not isinstance(n_splits, Integral) or n_splits < 2:
+        raise ValueError("n_splits must be an integer of at least 2.")
+
+    # Reuse the existing split configuration validation for fraction and seed.
+    config = PreprocessingConfig(test_size=calibration_size, random_state=random_state)
+    X_pos = X.reset_index(drop=True)
+    y_pos = y.reset_index(drop=True)
+    groups = predictor_group_ids(X_pos)
+    if any(len(np.unique(groups[y_pos.to_numpy() == label])) < n_splits for label in (0, 1)):
+        raise ValueError("Too few distinct predictor groups per class for the requested folds.")
+
+    splitter = StratifiedGroupKFold(
+        n_splits=int(n_splits), shuffle=True, random_state=config.random_state,
+    )
+    folds = []
+    for outer_train, scoring in splitter.split(X_pos, y_pos, groups):
+        # Reserve calibration rows from the outer training subset only.
+        X_fit, X_cal, _, _ = create_train_test_split(
+            X_pos.iloc[outer_train], y_pos.iloc[outer_train],
+            test_size=config.test_size, random_state=config.random_state,
+            duplicate_aware=True,
+        )
+        fit = X_fit.index.to_numpy(dtype=np.intp)
+        calibration = X_cal.index.to_numpy(dtype=np.intp)
+        scoring = np.asarray(scoring, dtype=np.intp)
+        parts = (fit, calibration, scoring)
+
+        # Reject infeasible stratification rather than scoring a single-class fold.
+        if any(set(y_pos.iloc[part].unique()) != {0, 1} for part in parts):
+            raise ValueError("Every fit, calibration and scoring subset must contain both classes.")
+        group_sets = [set(groups[part]) for part in parts]
+        if any(not group_sets[i].isdisjoint(group_sets[j]) for i, j in ((0, 1), (0, 2), (1, 2))):
+            raise RuntimeError("Predictor groups overlap within a CV fold.")
+        if not np.array_equal(np.sort(np.concatenate(parts)), np.arange(len(X_pos))):
+            raise RuntimeError("CV fold lost observations or assigned them twice.")
+        folds.append(parts)
+
+    # Across folds, every original training row must be scored exactly once.
+    if not np.array_equal(np.sort(np.concatenate([fold[2] for fold in folds])), np.arange(len(X_pos))):
+        raise RuntimeError("CV scoring folds do not partition the training data.")
+    return folds
+
+
 # ============================================================
 # 10. EDA-driven feature engineering
 # ============================================================
@@ -750,6 +816,8 @@ class AdultFeatureEngineer(
         education_representation="education-num",
         interaction_features=False,
     ):
+
+        """Initialize the configurable Adult Income feature transformations."""
 
         self.capital_transform = capital_transform
 
@@ -900,6 +968,7 @@ class OccupationHoursTransformer(
     """
 
     def fit(self, X, y=None):
+        """Learn occupation-specific output feature names from training data."""
 
         if not isinstance(X, pd.DataFrame):
             raise TypeError("OccupationHoursTransformer requires a DataFrame.")
@@ -936,6 +1005,7 @@ class OccupationHoursTransformer(
         return self.output_features_.copy()
 
     def transform(self, X):
+        """Generate occupation-specific working-hour interaction features."""
 
         if not hasattr(self, "occupations_"):
             raise RuntimeError("OccupationHoursTransformer must be fitted first.")
@@ -1024,10 +1094,14 @@ class NumericalFeatureSelector:
     """
 
     def __init__(self, feature_names, include_interactions=False):
+        """Initialize the selector with configured numerical feature names."""
+
         self.feature_names = list(feature_names)
         self.include_interactions = include_interactions
 
     def __call__(self, X):
+        """Select configured numerical columns and optional interaction features."""
+
         selected = list(self.feature_names)
 
         if self.include_interactions:
@@ -1193,6 +1267,7 @@ def transform_datasets(
     feature_names = preprocessor.get_feature_names_out()
 
     def frame(X, values):
+        """Restore feature names and original row indices after transformation."""
         return pd.DataFrame(values, columns=feature_names, index=X.index)
 
     train_processed = frame(X_train, train_array)
@@ -1231,6 +1306,36 @@ def save_processed_data(
     if X_val is not None:
         X_val.to_csv(output_dir / "X_val.csv", index=False)
         y_val.to_csv(output_dir / "y_val.csv", index=False)
+
+
+def load_untransformed_partition(
+    output_dir: str | Path,
+    partition: str = "train",
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Load cleaned, untransformed predictors and encoded labels for train or val.
+
+    The test partition is deliberately unsupported. Files are generated by the
+    regular preprocessing pipeline from its existing partition assignments.
+    """
+    if partition not in ("train", "val"):
+        raise ValueError("Untransformed partition must be 'train' or 'val'.")
+    path = Path(output_dir) / f"raw_{partition}.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing {path}; rerun preprocessing to generate raw partitions.")
+
+    # Empty cells represent missing values; preserve literal categorical strings.
+    frame = pd.read_csv(
+        path, keep_default_na=False, na_values=[""], float_precision="round_trip",
+        dtype={column: str for column in CATEGORICAL_FEATURES},
+    )
+    if list(frame.columns) != FEATURE_COLUMNS + [TARGET_COLUMN]:
+        raise ValueError(f"Unexpected untransformed partition schema: {path}")
+    X, y = split_features_target(frame)
+    for column in NUMERICAL_FEATURES:
+        X[column] = pd.to_numeric(X[column], errors="raise")
+    if y.isna().any() or set(y.unique()) != {0, 1}:
+        raise ValueError(f"Untransformed partition requires both binary classes: {path}")
+    return X, y.astype("int64")
 
 
 # ============================================================
@@ -1382,6 +1487,13 @@ def run_preprocessing_pipeline(
         X_val=X_val_processed,
         y_val=y_val,
     )
+
+    # Persist the exact existing development partitions for fold-local fitting.
+    # Store labels with predictors to preserve row alignment; never export raw test here.
+    for partition, X_raw, y_raw in (("train", X_train, y_train), ("val", X_val, y_val)):
+        X_raw.assign(**{TARGET_COLUMN: y_raw}).to_csv(
+            Path(output_dir) / f"raw_{partition}.csv", index=False,
+        )
 
     save_preprocessor(
         preprocessor,

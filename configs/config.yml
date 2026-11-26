@@ -1,9 +1,12 @@
-# Sprint 17 — model-training configuration
-# Lists in "grid" are Cartesian products in full mode.
-# Quick mode uses the first combination from each family.
+# Adult Income AI — model-training configuration
+# Search defaults: first in validation mode, grid in full mode.
+# Either mode may explicitly select first or grid; CV is validation-only.
 seed: 42
 variants: [baseline, robust, interactions]
-selection_metric: val_f1
+selection_metric: val_f1  # Existing holdout ranking; CV ranks by mean cv_f1.
+cross_validation:
+  n_splits: 3
+  calibration_size: 0.20  # Fraction of each outer fold training subset.
 paths:
   processed_dir: data/processed
   preprocessor_dir: models/preprocessors

@@ -8,6 +8,8 @@ preprocessing partitions.
 
 Usage:
     python -m src.models.train --quick
+    python -m src.models.train --mode validation --evaluation cv
+    python -m src.models.train --quick --evaluation cv  # Compatible alias
     python -m src.models.train
 
 Required inputs for each preprocessing variant:
@@ -24,7 +26,8 @@ Required inputs for each preprocessing variant:
 The script:
     - Never reloads raw datasets.
     - Never recreates dataset splits.
-    - Never refits saved preprocessing transformers.
+    - Never refits saved preprocessing transformers in holdout mode.
+    - CV mode fits independent preprocessors from saved raw training rows.
     - Fits candidate models using training data only.
     - Selects models and thresholds using validation data.
     - Evaluates winners using held-out test data.
@@ -47,7 +50,7 @@ import uuid
 import tempfile
 import warnings
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
@@ -65,6 +68,8 @@ from sklearn.preprocessing import FunctionTransformer
 from .algorithms.base import BINARY_CLASSIFICATION
 from .algorithms.registry import ALGORITHM_REGISTRY
 from .tasks import binary_classification as binary_task
+from . import cross_validation as cv
+from src.data.preprocess import PreprocessingConfig, load_untransformed_partition
 
 # Preserve the existing public evaluation functions for callers and tests.
 from .tasks.binary_classification import evaluate, optimal_threshold, rank
@@ -84,6 +89,9 @@ VARIANTS = (
     "interactions",
 )
 
+# Defaults also support older YAML files without a cross_validation section.
+DEFAULT_CV_SETTINGS = {"n_splits": 3, "calibration_size": 0.20}
+
 
 
 
@@ -101,8 +109,8 @@ class Dataset:
     X_val: pd.DataFrame
     y_val: pd.Series
 
-    X_test: pd.DataFrame
-    y_test: pd.Series
+    X_test: pd.DataFrame | None
+    y_test: pd.Series | None
 
     preprocessor_path: Path
 
@@ -115,17 +123,21 @@ def load_variant(
     processed_dir: Path,
     preprocessor_dir: Path,
     variant: str,
+    *,
+    include_test: bool = True,
 ) -> Dataset:
     """
     Load partitions generated during preprocessing.
 
     No splitting, cleaning, or preprocessing is performed.
+    Validation-only callers must set include_test=False.
     """
 
     folder = processed_dir / variant
     matrices = {}
 
-    for split in ("train", "val", "test"):
+    splits = ("train", "val", "test") if include_test else ("train", "val")
+    for split in splits:
 
         x_path = folder / f"X_{split}.csv"
         y_path = folder / f"y_{split}.csv"
@@ -186,7 +198,7 @@ def load_variant(
     # Validate consistent feature columns and ordering.
     train_columns = matrices["train"][0].columns
 
-    for split in ("val", "test"):
+    for split in splits[1:]:
 
         if not train_columns.equals(
             matrices[split][0].columns
@@ -214,7 +226,7 @@ def load_variant(
     return Dataset(
         *matrices["train"],
         *matrices["val"],
-        *matrices["test"],
+        *matrices.get("test", (None, None)),
         preprocessor_path=preprocessor_path,
     )
 
@@ -222,6 +234,39 @@ def load_variant(
 # ============================================================
 # 4. Model candidates and hyperparameters
 # ============================================================
+
+def resolve_cv_settings(config: dict, args=None) -> dict:
+    """Validate YAML CV settings and apply explicit validation-mode overrides."""
+    section = config.get("cross_validation", {})
+    if not isinstance(section, dict):
+        raise ValueError("cross_validation must be a mapping.")
+    unknown = section.keys() - DEFAULT_CV_SETTINGS.keys()
+    if unknown:
+        raise ValueError(f"Unknown cross_validation keys: {sorted(map(str, unknown))}")
+    settings = {**DEFAULT_CV_SETTINGS, **section}
+
+    def validate(values: dict) -> None:
+        """Reject invalid fold counts and calibration fractions before training."""
+        folds = values["n_splits"]
+        fraction = values["calibration_size"]
+        if type(folds) is not int or folds < 2:
+            raise ValueError("cross_validation.n_splits must be an integer of at least 2.")
+        if type(fraction) not in (int, float) or not 0 < fraction < 1:
+            raise ValueError("cross_validation.calibration_size must be between 0 and 1 (exclusive).")
+
+    # Invalid YAML is not silently repaired by CLI overrides.
+    validate(settings)
+    overrides = {
+        "n_splits": getattr(args, "cv_folds", None),
+        "calibration_size": getattr(args, "calibration_size", None),
+    }
+    overrides = {key: value for key, value in overrides.items() if value is not None}
+    if overrides and resolve_evaluation(args) != "cv":
+        raise ValueError("CV overrides require --evaluation cv.")
+    settings.update(overrides)
+    validate(settings)
+    return settings
+
 
 def load_training_config(path: Path | None = None) -> dict:
     """Load and validate YAML settings before starting any training."""
@@ -269,6 +314,7 @@ def load_training_config(path: Path | None = None) -> dict:
             raise ValueError(f"paths.{key} must be a string.")
     if not isinstance(config["mlflow"].get("experiment"), str):
         raise ValueError("mlflow.experiment must be a string.")
+    config["cross_validation"] = resolve_cv_settings(config)
     return config
 
 
@@ -521,6 +567,124 @@ def build_deployable_pipeline(
 # 8. Main training workflow
 # ============================================================
 
+def resolve_evaluation(args) -> str:
+    """Resolve the evaluation protocol and reject CV in the full lifecycle."""
+    evaluation = getattr(args, "evaluation", "holdout")
+    if evaluation not in ("holdout", "cv"):
+        raise ValueError(f"Unsupported evaluation protocol: {evaluation}")
+    if evaluation == "cv" and not args.quick:
+        raise ValueError("Cross-validation requires --quick or --mode validation; full evaluation is separate.")
+    return evaluation
+
+
+def cv_rank(row: dict) -> tuple[float, float, float]:
+    """Rank cross-validation candidates without mixing holdout metrics."""
+    return row["cv_f1"], row["cv_pr_auc"], row["cv_roc_auc"]
+
+
+def log_cv_fold(fold: cv.PreparedFold, model, result: cv.FoldResult) -> None:
+    """Log a complete fold-specific research pipeline and threshold to MLflow."""
+    pipeline = build_deployable_pipeline(
+        fold.preprocessor, model, fold.X_fit.columns, fold.X_fit,
+    )
+    # Each fold has different learned transformations and a separate threshold.
+    # These research artifacts are never packaged as promotion candidates.
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder)
+        joblib.dump(pipeline, path / "model_pipeline.joblib")
+        (path / "fold_result.json").write_text(
+            json.dumps(asdict(result), indent=2), encoding="utf-8",
+        )
+        for name in ("model_pipeline.joblib", "fold_result.json"):
+            mlflow.log_artifact(str(path / name), artifact_path=f"cv/fold_{result.number}")
+
+
+def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
+                  execution_id: str, config_sha256: str) -> None:
+    """Evaluate the existing first/grid candidates on raw training folds only.
+
+    Reuse the registry, candidate generator and MLflow experiment configured by
+    train(). CV has distinct metrics and outputs, and cannot promote a model.
+    """
+    specifications = candidates(scope["search"] == "first", config=config)
+    rows, winners = [], {}
+    # Require identical training rows across selected variants before fitting any model.
+    hashes = {variant: file_sha256(processed / variant / "raw_train.csv")
+              for variant in scope["variants"]}
+    if len(set(hashes.values())) != 1:
+        raise ValueError("Raw training partitions differ across preprocessing variants.")
+    raw_hash = next(iter(hashes.values()))
+    revision = git_revision()
+    cv_settings = resolve_cv_settings(config)
+    n_splits = cv_settings["n_splits"]
+    calibration_size = cv_settings["calibration_size"]
+    for variant in scope["variants"]:
+        folder = processed / variant
+        config_path = folder / "preprocessing_config.json"
+        preprocess_config = PreprocessingConfig(**json.loads(config_path.read_text(encoding="utf-8")))
+        X, y = load_untransformed_partition(folder, "train")
+        # Prepare once per feature representation; every candidate refits its estimator.
+        folds = cv.prepare_cv_folds(X, y, preprocess_config, n_splits=n_splits,
+                                   calibration_size=calibration_size, random_state=config["seed"])
+        best = None
+        for family, params, prototype in specifications:
+            with mlflow.start_run(run_name=f"cv-{variant}-{family}-{len(rows):03d}") as run:
+                mlflow.set_tags({
+                    "preprocessing_variant": variant, "model_family": family,
+                    "mode": "quick", "evaluation_protocol": "cv",
+                    "data_source": "raw_training_partition",
+                    "training_execution_id": execution_id,
+                    "candidate_index": str(len(rows)), "search_strategy": scope["search"],
+                })
+                if revision:
+                    mlflow.set_tag("git_commit", revision)
+                mlflow.log_params({
+                    "variant": variant, "model": family, "config_sha256": config_sha256,
+                    "data_version": raw_hash, "preprocessing_config_sha256": file_sha256(config_path),
+                    "seed": config["seed"], "n_splits": n_splits,
+                    "calibration_size": calibration_size,
+                    "search_strategy": scope["search"],
+                    "threshold_policy": "fold_fit_inner_calibration",
+                    **{f"fixed_{k}": str(v) for k, v in config["models"][family]["fixed"].items()},
+                    **{f"model_{k}": str(v) for k, v in params.items()},
+                })
+                # Let failures propagate so MLflow marks the run FAILED and the CLI exits nonzero.
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", ConvergenceWarning)
+                    result = cv.evaluate_cv_candidate(prototype, folds, on_fold=log_cv_fold)
+                warning_count = sum(issubclass(w.category, ConvergenceWarning) for w in caught)
+                metrics = {f"cv_{key}": value for key, value in result.mean_metrics.items()}
+                metrics.update({f"cv_{key}_std": value for key, value in result.std_metrics.items()})
+                mlflow.log_metrics({**metrics, "convergence_warning_count": warning_count})
+                row = {
+                    "run_id": run.info.run_id, "variant": variant, "model": family,
+                    "parameters": json.dumps(params, sort_keys=True),
+                    **metrics, "convergence_warning_count": warning_count, "status": "FINISHED",
+                }
+                rows.append(row)
+                if best is None or cv_rank(row) > cv_rank(best):
+                    best = row
+                LOG.info("CV %s / %s: F1=%.4f (+/- %.4f)", variant, family,
+                         row["cv_f1"], row["cv_f1_std"])
+            # Persist completed candidates even if a later candidate fails.
+            pd.DataFrame(rows).sort_values(
+                ["cv_f1", "cv_pr_auc", "cv_roc_auc"], ascending=False, kind="stable",
+            ).to_csv(output / "cv_leaderboard.csv", index=False)
+        if best is None:
+            raise RuntimeError(f"No CV candidates completed for {variant}")
+        winners[variant] = {"cross_validation": best}
+    preferred = max(winners, key=lambda variant: cv_rank(winners[variant]["cross_validation"]))
+    atomic_json_write(output / "cv_training_summary.json", {
+        "execution_id": execution_id, "output_dir": str(output), "quick": True,
+        "evaluation_protocol": "cv", "scope": scope, "config_sha256": config_sha256,
+        "raw_training_sha256": raw_hash, "git_commit": revision, "n_splits": n_splits,
+        "calibration_size": calibration_size, "candidate_count": len(rows),
+        "successful_candidates": len(rows), "preferred_variant_by_cv": preferred,
+        "winners": winners,
+    })
+    LOG.info("Preferred configuration by CV: %s", preferred)
+
+
 def train(args):
     """
     Run model selection across preprocessing configurations.
@@ -537,8 +701,11 @@ def train(args):
     Existing preprocessing artifacts are never modified.
     """
 
+    evaluation = resolve_evaluation(args)
     config = load_training_config(getattr(args, "config", None))
     config, search = resolve_training_scope(config, args)
+    # Resolve effective settings before creating any output or tracking artifacts.
+    config["cross_validation"] = resolve_cv_settings(config, args)
     active_variants = config["variants"]
     scope = {
         "models": list(config["models"]),
@@ -563,24 +730,23 @@ def train(args):
     db = args.mlflow_db.resolve()
     artifacts = args.mlflow_artifacts.resolve()
 
-    # Load existing datasets.
+    # Record configuration and initialize tracking for either evaluation protocol.
+    config_sha256 = file_sha256(Path(getattr(args, "config", None) or ROOT / "configs/config.yml"))
+    configure_mlflow(args.experiment, db, artifacts)
+    if evaluation == "cv":
+        run_cv_search(config, scope, processed, output, execution_id, config_sha256)
+        return
+
+    # Only the full lifecycle may open the held-out test CSVs.
     datasets = {
         variant: load_variant(
             processed,
             preprocessor_dir,
             variant,
+            include_test=not args.quick,
         )
         for variant in active_variants
     }
-
-    # Record the exact configuration used for reproducibility.
-    config_sha256 = file_sha256(Path(getattr(args, "config", None) or ROOT / "configs/config.yml"))
-    # Configure MLflow.
-    configure_mlflow(
-        args.experiment,
-        db,
-        artifacts,
-    )
 
     leaderboard = []
     winners = {}
@@ -1160,9 +1326,14 @@ def parse_args():
     parser.add_argument("--mlflow-db", type=Path, default=None)
     parser.add_argument("--mlflow-artifacts", type=Path, default=None)
     parser.add_argument("--experiment", default=None)
-    parser.add_argument(
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument(
+        "--mode", choices=("validation", "full"), default=None,
+        help="Validation-only development or full held-out evaluation (default: full).",
+    )
+    lifecycle.add_argument(
         "--quick", action="store_true",
-        help="Development mode: validation only; never package a promotion candidate.",
+        help="Backward-compatible alias for --mode validation.",
     )
     parser.add_argument(
         "--models", nargs="+", choices=ALGORITHM_REGISTRY.names(),
@@ -1176,12 +1347,29 @@ def parse_args():
         "--search", choices=("first", "grid"), default=None,
         help="Search depth (default: first in quick mode, grid in full mode).",
     )
+    parser.add_argument(
+        "--evaluation", choices=("holdout", "cv"), default="holdout",
+        help="Saved validation (default), or training-only CV in validation mode.",
+    )
+    parser.add_argument(
+        "--cv-folds", type=int, default=None,
+        help="Override YAML cross_validation.n_splits (CV only).",
+    )
+    parser.add_argument(
+        "--calibration-size", type=float, default=None,
+        help="Override YAML cross_validation.calibration_size (CV only).",
+    )
     parser.add_argument("--show-mlflow-command", action="store_true")
     args = parser.parse_args()
-    config = load_training_config(args.config)
+    # Keep the existing internal quick flag and output contracts for CI and callers.
+    args.mode = args.mode or ("validation" if args.quick else "full")
+    args.quick = args.mode == "validation"
     try:
+        config = load_training_config(args.config)
         resolve_training_scope(config, args)
-    except ValueError as exc:
+        resolve_evaluation(args)
+        resolve_cv_settings(config, args)
+    except (ValueError, FileNotFoundError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     # Resolve relative paths against repository root, not the shell's cwd.
     for attr in ("processed_dir", "preprocessor_dir", "output_dir",
