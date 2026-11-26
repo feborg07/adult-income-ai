@@ -46,6 +46,8 @@ import json
 import logging
 import subprocess
 import os
+import sys
+from importlib.metadata import PackageNotFoundError, version
 import uuid
 import tempfile
 import warnings
@@ -69,6 +71,7 @@ from .algorithms.base import BINARY_CLASSIFICATION
 from .algorithms.registry import ALGORITHM_REGISTRY
 from .tasks import binary_classification as binary_task
 from . import cross_validation as cv
+from .search.configuration import validate_optuna_config
 from src.data.preprocess import PreprocessingConfig, load_untransformed_partition
 
 # Preserve the existing public evaluation functions for callers and tests.
@@ -315,6 +318,7 @@ def load_training_config(path: Path | None = None) -> dict:
     if not isinstance(config["mlflow"].get("experiment"), str):
         raise ValueError("mlflow.experiment must be a string.")
     config["cross_validation"] = resolve_cv_settings(config)
+    validate_optuna_config(config)
     return config
 
 
@@ -345,8 +349,27 @@ def resolve_training_scope(config: dict, args) -> tuple[dict, str]:
     search = getattr(args, "search", None)
     if search is None:
         search = "first" if args.quick else "grid"
-    if search not in ("first", "grid"):
+    if search not in ("first", "grid", "optuna"):
         raise ValueError(f"Unsupported search strategy: {search}")
+    trials = getattr(args, "trials", None)
+    if trials is not None and (search != "optuna" or type(trials) is not int or trials < 1):
+        raise ValueError("--trials requires Optuna and a positive integer budget.")
+    if getattr(args, "optuna_storage", None) is not None and search != "optuna":
+        raise ValueError("--optuna-storage requires --search optuna.")
+    if search == "optuna":
+        if not args.quick or getattr(args, "evaluation", "holdout") != "cv":
+            raise ValueError("Optuna requires --mode validation --evaluation cv (or --quick).")
+        if "optuna" not in config:
+            raise ValueError("Optuna settings are missing from YAML.")
+        supported = {name: spec for name, spec in effective["models"].items()
+                     if "optuna" in spec}
+        if getattr(args, "models", None) is not None and supported.keys() != effective["models"].keys():
+            raise ValueError("Selected model families have no Optuna search space: "
+                             f"{sorted(effective['models'].keys() - supported.keys())}")
+        if not supported:
+            raise ValueError("No selected model family has an Optuna search space.")
+        # With no explicit selection, use only families configured for Optuna.
+        effective["models"] = supported
     return effective, search
 
 
@@ -599,15 +622,74 @@ def log_cv_fold(fold: cv.PreparedFold, model, result: cv.FoldResult) -> None:
             mlflow.log_artifact(str(path / name), artifact_path=f"cv/fold_{result.number}")
 
 
-def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
-                  execution_id: str, config_sha256: str) -> None:
-    """Evaluate the existing first/grid candidates on raw training folds only.
+def optimization_code_identity() -> dict:
+    """Fingerprint actual source bytes and installed versions, including dirty edits."""
+    files = sorted((ROOT / "src/models").rglob("*.py"))
+    files += [ROOT / "src/data/preprocess.py", ROOT / "requirements.txt"]
+    # Git HEAD alone misses uncommitted implementation changes.
+    source = {path.relative_to(ROOT).as_posix(): file_sha256(path) for path in files}
+    versions = {}
+    for package in ("optuna", "mlflow", "scikit-learn", "numpy", "pandas", "scipy",
+                    "joblib", "lightgbm", "xgboost", "catboost"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    return {"source": source, "python": sys.version, "dependencies": versions}
 
-    Reuse the registry, candidate generator and MLflow experiment configured by
-    train(). CV has distinct metrics and outputs, and cannot promote a model.
+
+def resolve_optuna_storage(config: dict, args) -> Path:
+    """Resolve the SQLite path and prohibit writes to reference or tracking files."""
+    path = (ROOT / Path(getattr(args, "optuna_storage", None)
+                        or config["optuna"]["storage_path"])).resolve()
+    reference = (ROOT / "models/reference").resolve()
+    tracking = args.mlflow_db.resolve()
+    if path.suffix != ".db":
+        raise ValueError("Optuna storage must be a SQLite .db file.")
+    if path == reference or reference in path.parents:
+        raise ValueError("Optuna storage must be separate from models/reference.")
+    if path == tracking:
+        raise ValueError("Optuna and MLflow must use different SQLite databases.")
+    return path
+
+
+def write_cv_leaderboard(path: Path, rows: list[dict]) -> None:
+    """Write a deterministic leaderboard, including headers for a no-op resume."""
+    ranking = ["cv_f1", "cv_pr_auc", "cv_roc_auc"]
+    frame = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
+        "run_id", "variant", "model", "parameters", *ranking, "cv_f1_std", "status",
+        "optuna_study_name", "optuna_trial_number", "training_execution_id",
+    ])
+    frame.sort_values(ranking, ascending=False, kind="stable").to_csv(path, index=False)
+
+
+def completed_study_rows(study) -> list[dict]:
+    """Read only completed trials with consistent persisted tracking provenance."""
+    from optuna.trial import TrialState
+
+    rows = []
+    for trial in study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)):
+        row = trial.user_attrs.get("evaluation_metadata")
+        if (not isinstance(row, dict) or not row.get("run_id")
+                or not row.get("training_execution_id")
+                or row.get("optuna_study_name") != study.study_name
+                or row.get("optuna_trial_number") != trial.number
+                or row.get("cv_f1") != trial.value or row.get("status") != "FINISHED"):
+            raise RuntimeError(f"Missing or inconsistent tracking provenance for {study.study_name} trial {trial.number}.")
+        rows.append(row)
+    return rows
+
+
+def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
+                  execution_id: str, config_sha256: str, *,
+                  study_db: Path | None = None, tracking_identity: dict | None = None) -> None:
+    """Run first/grid or adaptive search with one shared CV evaluation lifecycle.
+
+    Raw training partitions alone are accessed. Cache prepared folds by variant
+    and keep research artifacts separate from deployable reference models.
+    Optuna studies resume from persistent SQLite storage under a fixed context.
     """
-    specifications = candidates(scope["search"] == "first", config=config)
-    rows, winners = [], {}
+    rows, winners, studies, study_rows = [], {}, {}, []
     # Require identical training rows across selected variants before fitting any model.
     hashes = {variant: file_sha256(processed / variant / "raw_train.csv")
               for variant in scope["variants"]}
@@ -618,71 +700,165 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
     cv_settings = resolve_cv_settings(config)
     n_splits = cv_settings["n_splits"]
     calibration_size = cv_settings["calibration_size"]
-    for variant in scope["variants"]:
-        folder = processed / variant
-        config_path = folder / "preprocessing_config.json"
-        preprocess_config = PreprocessingConfig(**json.loads(config_path.read_text(encoding="utf-8")))
-        X, y = load_untransformed_partition(folder, "train")
-        # Prepare once per feature representation; every candidate refits its estimator.
-        folds = cv.prepare_cv_folds(X, y, preprocess_config, n_splits=n_splits,
-                                   calibration_size=calibration_size, random_state=config["seed"])
-        best = None
-        for family, params, prototype in specifications:
-            with mlflow.start_run(run_name=f"cv-{variant}-{family}-{len(rows):03d}") as run:
-                mlflow.set_tags({
-                    "preprocessing_variant": variant, "model_family": family,
-                    "mode": "quick", "evaluation_protocol": "cv",
-                    "data_source": "raw_training_partition",
-                    "training_execution_id": execution_id,
-                    "candidate_index": str(len(rows)), "search_strategy": scope["search"],
-                })
-                if revision:
-                    mlflow.set_tag("git_commit", revision)
-                mlflow.log_params({
-                    "variant": variant, "model": family, "config_sha256": config_sha256,
-                    "data_version": raw_hash, "preprocessing_config_sha256": file_sha256(config_path),
-                    "seed": config["seed"], "n_splits": n_splits,
-                    "calibration_size": calibration_size,
-                    "search_strategy": scope["search"],
-                    "threshold_policy": "fold_fit_inner_calibration",
-                    **{f"fixed_{k}": str(v) for k, v in config["models"][family]["fixed"].items()},
-                    **{f"model_{k}": str(v) for k, v in params.items()},
-                })
-                # Let failures propagate so MLflow marks the run FAILED and the CLI exits nonzero.
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always", ConvergenceWarning)
-                    result = cv.evaluate_cv_candidate(prototype, folds, on_fold=log_cv_fold)
-                warning_count = sum(issubclass(w.category, ConvergenceWarning) for w in caught)
-                metrics = {f"cv_{key}": value for key, value in result.mean_metrics.items()}
-                metrics.update({f"cv_{key}_std": value for key, value in result.std_metrics.items()})
-                mlflow.log_metrics({**metrics, "convergence_warning_count": warning_count})
-                row = {
-                    "run_id": run.info.run_id, "variant": variant, "model": family,
-                    "parameters": json.dumps(params, sort_keys=True),
-                    **metrics, "convergence_warning_count": warning_count, "status": "FINISHED",
-                }
-                rows.append(row)
-                if best is None or cv_rank(row) > cv_rank(best):
-                    best = row
-                LOG.info("CV %s / %s: F1=%.4f (+/- %.4f)", variant, family,
-                         row["cv_f1"], row["cv_f1_std"])
-            # Persist completed candidates even if a later candidate fails.
-            pd.DataFrame(rows).sort_values(
-                ["cv_f1", "cv_pr_auc", "cv_roc_auc"], ascending=False, kind="stable",
-            ).to_csv(output / "cv_leaderboard.csv", index=False)
-        if best is None:
-            raise RuntimeError(f"No CV candidates completed for {variant}")
-        winners[variant] = {"cross_validation": best}
-    preferred = max(winners, key=lambda variant: cv_rank(winners[variant]["cross_validation"]))
-    atomic_json_write(output / "cv_training_summary.json", {
+    config_hashes = {variant: file_sha256(processed / variant / "preprocessing_config.json")
+                     for variant in scope["variants"]}
+    prepared = {}
+
+    def get_folds(variant):
+        """Prepare each selected representation only when first requested."""
+        if variant not in prepared:
+            folder = processed / variant
+            preprocess_config = PreprocessingConfig(**json.loads(
+                (folder / "preprocessing_config.json").read_text(encoding="utf-8")))
+            X, y = load_untransformed_partition(folder, "train")
+            prepared[variant] = cv.prepare_cv_folds(
+                X, y, preprocess_config, n_splits=n_splits,
+                calibration_size=calibration_size, random_state=config["seed"],
+            )
+        return prepared[variant]
+
+    def evaluate_candidate(variant, family, params, prototype, trial=None):
+        """Fit, calibrate, score and log one candidate regardless of search strategy."""
+        folds = get_folds(variant)
+        fixed = config["models"][family]["fixed"]
+        if trial is not None:
+            # Report actual fixed values, not settings overridden by a sampled value.
+            fixed = {key: value for key, value in fixed.items() if key not in params}
+        tags = {
+            "preprocessing_variant": variant, "model_family": family,
+            "mode": "quick", "evaluation_protocol": "cv",
+            "data_source": "raw_training_partition", "training_execution_id": execution_id,
+            "candidate_index": str(len(rows)), "search_strategy": scope["search"],
+        }
+        if trial is not None:
+            tags.update({"optuna_study_name": trial.study_name,
+                         "optuna_trial_number": str(trial.trial_number),
+                         "optuna_context_id": context})
+        with mlflow.start_run(run_name=f"cv-{variant}-{family}-{len(rows):03d}") as run:
+            mlflow.set_tags(tags)
+            if revision:
+                mlflow.set_tag("git_commit", revision)
+            mlflow.log_params({
+                "variant": variant, "model": family, "config_sha256": config_sha256,
+                "data_version": raw_hash, "preprocessing_config_sha256": config_hashes[variant],
+                "seed": config["seed"], "n_splits": n_splits,
+                "calibration_size": calibration_size, "search_strategy": scope["search"],
+                "threshold_policy": "fold_fit_inner_calibration",
+                **{f"fixed_{k}": str(v) for k, v in fixed.items()},
+                **{f"model_{k}": str(v) for k, v in params.items()},
+            })
+            # Fail fast on estimator, preprocessing or tracking errors; do not hide them.
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ConvergenceWarning)
+                result = cv.evaluate_cv_candidate(prototype, folds, on_fold=log_cv_fold)
+            warning_count = sum(issubclass(w.category, ConvergenceWarning) for w in caught)
+            metrics = {f"cv_{key}": value for key, value in result.mean_metrics.items()}
+            metrics.update({f"cv_{key}_std": value for key, value in result.std_metrics.items()})
+            mlflow.log_metrics({**metrics, "convergence_warning_count": warning_count})
+            row = {
+                "run_id": run.info.run_id, "variant": variant, "model": family,
+                "parameters": json.dumps(params, sort_keys=True),
+                **metrics, "convergence_warning_count": warning_count, "status": "FINISHED",
+            }
+            if trial is not None:
+                row.update({"optuna_study_name": trial.study_name,
+                            "optuna_trial_number": trial.trial_number,
+                            "effective_parameters": json.dumps(trial.effective_params, sort_keys=True),
+                            "training_execution_id": execution_id})
+        # Only rank a candidate after its tracking run has finished successfully.
+        rows.append(row)
+        best = winners.get(variant)
+        if best is None or cv_rank(row) > cv_rank(best["cross_validation"]):
+            winners[variant] = {"cross_validation": row}
+        LOG.info("CV %s / %s: F1=%.4f (+/- %.4f)", variant, family,
+                 row["cv_f1"], row["cv_f1_std"])
+        # Persist completed candidates even if a later candidate fails.
+        write_cv_leaderboard(output / "cv_leaderboard.csv", rows)
+        return row
+
+    if scope["search"] == "optuna":
+        # Lazy imports preserve the legacy search path and avoid loading Optuna unnecessarily.
+        import optuna
+        from .search.optuna_search import EvaluationOutcome, run_optuna_search
+        from .search.persistence import exclusive_study_lock
+
+        if study_db is None or tracking_identity is None:
+            raise ValueError("Persistent Optuna requires a database and tracking identity.")
+        study_db.parent.mkdir(parents=True, exist_ok=True)
+        storage_uri = f"sqlite:///{study_db.as_posix()}"
+        context_details = {
+            "raw_training": raw_hash, "preprocessing": config_hashes,
+            "variants": scope["variants"], "cv": cv_settings, "seed": config["seed"],
+            "code": optimization_code_identity(), "tracking": tracking_identity,
+            "config_sha256": config_sha256,
+            "threshold_policy": "fold_fit_inner_calibration",
+        }
+        context = hashlib.sha256(json.dumps(context_details, sort_keys=True).encode("utf-8")).hexdigest()
+
+        def evaluate_trial(trial):
+            """Build the sampled estimator through its plugin and return mean CV F1."""
+            plugin = ALGORITHM_REGISTRY.get(trial.family, task_type=BINARY_CLASSIFICATION)
+            prototype = plugin.build(trial.effective_params, config["seed"])
+            row = evaluate_candidate(trial.variant, trial.family, trial.sampled_params,
+                                     prototype, trial=trial)
+            return EvaluationOutcome(score=row["cv_f1"], metadata=row)
+
+        for family in scope["models"]:
+            sampler = optuna.samplers.TPESampler(
+                seed=config["seed"], n_startup_trials=config["optuna"]["n_startup_trials"],
+            )
+            study_name = f"adult-income-{family}-{context}"
+            # SQLite storage and the advisory lock enforce serial study execution.
+            # A crashed process leaves the lock for explicit operator inspection.
+            with exclusive_study_lock(study_db, study_name):
+                study = optuna.create_study(direction="maximize", sampler=sampler,
+                                            study_name=study_name, storage=storage_uri,
+                                            load_if_exists=True)
+                result = run_optuna_search(study, config, family, scope["variants"], evaluate_trial,
+                                           context_id=context, trials=scope["trial_budgets"][family])
+                studies[family] = asdict(result)
+                if not result.completed:
+                    raise RuntimeError(f"No Optuna candidates completed for {family}")
+                family_rows = completed_study_rows(study)
+                study_rows.extend(family_rows)
+                # Optuna chooses by F1 only; keep the project's secondary tie-breakers.
+                studies[family]["best_ranked_candidate"] = max(family_rows, key=cv_rank)
+                LOG.info("Optuna %s: %s attempted this run, %s completed cumulatively",
+                         family, result.attempted_this_run, result.completed)
+    else:
+        specifications = candidates(scope["search"] == "first", config=config)
+        for variant in scope["variants"]:
+            for family, params, prototype in specifications:
+                evaluate_candidate(variant, family, params, prototype)
+            if variant not in winners:
+                raise RuntimeError(f"No CV candidates completed for {variant}")
+
+    if not winners and not study_rows:
+        raise RuntimeError("No CV candidates completed.")
+    # A satisfied cumulative budget is a successful no-op, not a new candidate.
+    preferred = (max(winners, key=lambda variant: cv_rank(winners[variant]["cross_validation"]))
+                 if winners else None)
+    if not rows:
+        write_cv_leaderboard(output / "cv_leaderboard.csv", rows)
+    summary = {
         "execution_id": execution_id, "output_dir": str(output), "quick": True,
         "evaluation_protocol": "cv", "scope": scope, "config_sha256": config_sha256,
         "raw_training_sha256": raw_hash, "git_commit": revision, "n_splits": n_splits,
         "calibration_size": calibration_size, "candidate_count": len(rows),
         "successful_candidates": len(rows), "preferred_variant_by_cv": preferred,
         "winners": winners,
-    })
-    LOG.info("Preferred configuration by CV: %s", preferred)
+    }
+    if studies:
+        # The Optuna best trial uses F1 alone; our leaderboard retains metric tie-breakers.
+        summary["optuna_studies"] = studies
+        summary["optuna_context_id"] = context
+        summary["optuna_context"] = context_details
+        summary["optuna_storage"] = str(study_db)
+        summary["optuna_cumulative_successful_candidates"] = len(study_rows)
+        summary["optuna_best_ranked_candidate"] = max(study_rows, key=cv_rank)
+        write_cv_leaderboard(output / "optuna_study_leaderboard.csv", study_rows)
+    atomic_json_write(output / "cv_training_summary.json", summary)
+    LOG.info("Preferred configuration by CV: %s", preferred if preferred else "no new candidates")
 
 
 def train(args):
@@ -712,6 +888,14 @@ def train(args):
         "variants": list(active_variants),
         "search": search,
     }
+    study_db = None
+    if search == "optuna":
+        study_db = resolve_optuna_storage(config, args)
+        override = getattr(args, "trials", None)
+        scope["trial_budgets"] = {
+            family: override if override is not None else config["models"][family]["optuna"]["trials"]
+            for family in scope["models"]
+        }
     processed = args.processed_dir.resolve()
     preprocessor_dir = args.preprocessor_dir.resolve()
     # Each invocation owns a unique directory, including quick runs.
@@ -734,7 +918,10 @@ def train(args):
     config_sha256 = file_sha256(Path(getattr(args, "config", None) or ROOT / "configs/config.yml"))
     configure_mlflow(args.experiment, db, artifacts)
     if evaluation == "cv":
-        run_cv_search(config, scope, processed, output, execution_id, config_sha256)
+        run_cv_search(config, scope, processed, output, execution_id, config_sha256,
+                      study_db=study_db, tracking_identity={
+                          "db": str(db), "artifacts": str(artifacts), "experiment": args.experiment,
+                      })
         return
 
     # Only the full lifecycle may open the held-out test CSVs.
@@ -1344,8 +1531,16 @@ def parse_args():
         help="Select preprocessing variants enabled in the YAML configuration.",
     )
     parser.add_argument(
-        "--search", choices=("first", "grid"), default=None,
+        "--search", choices=("first", "grid", "optuna"), default=None,
         help="Search depth (default: first in quick mode, grid in full mode).",
+    )
+    parser.add_argument(
+        "--trials", type=int, default=None,
+        help="Cumulative Optuna trial budget per family across selected variants (default: YAML).",
+    )
+    parser.add_argument(
+        "--optuna-storage", type=Path, default=None,
+        help="Override the YAML SQLite study path (Optuna only).",
     )
     parser.add_argument(
         "--evaluation", choices=("holdout", "cv"), default="holdout",

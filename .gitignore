@@ -73,6 +73,7 @@ desktop.ini
 /models/runs/
 /models/training/
 /models/preprocessors/
+/models/optimization/
 
 # Legacy root-level model artifacts
 /models/best_model_pipeline.joblib

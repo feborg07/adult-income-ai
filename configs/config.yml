@@ -1,12 +1,19 @@
 # Adult Income AI — model-training configuration
 # Search defaults: first in validation mode, grid in full mode.
 # Either mode may explicitly select first or grid; CV is validation-only.
+# Optuna requires validation-mode CV; compatible studies resume from SQLite.
+# Trial budgets are cumulative per family and selected variant scope.
 seed: 42
 variants: [baseline, robust, interactions]
 selection_metric: val_f1  # Existing holdout ranking; CV ranks by mean cv_f1.
 cross_validation:
   n_splits: 3
   calibration_size: 0.20  # Fraction of each outer fold training subset.
+# One study per family; the shared seed controls TPE. Trials include queued starts.
+optuna:
+  sampler: tpe
+  n_startup_trials: 5
+  storage_path: models/optimization/optuna.db
 paths:
   processed_dir: data/processed
   preprocessor_dir: models/preprocessors
@@ -37,6 +44,22 @@ models:
     grid:
       learning_rate: [0.05, 0.1]
       max_leaf_nodes: [15, 31]
+    optuna:
+      trials: 50
+      # Sampled parameters override matching fixed settings only in Optuna.
+      space:
+        max_iter: {type: int, low: 100, high: 800}
+        learning_rate: {type: float, low: 0.005, high: 0.2, log: true}
+        max_leaf_nodes: {type: int, low: 8, high: 63}
+        min_samples_leaf: {type: int, low: 10, high: 100}
+        l2_regularization: {type: float, low: 0.0, high: 10.0}
+        class_weight: {type: categorical, choices: [null, balanced]}
+      enqueue:
+        # Current CV winner and approved reference configuration.
+        - variant: baseline
+          params: {max_iter: 150, learning_rate: 0.05, max_leaf_nodes: 31, min_samples_leaf: 20, l2_regularization: 0.0, class_weight: null}
+        - variant: baseline
+          params: {max_iter: 150, learning_rate: 0.1, max_leaf_nodes: 15, min_samples_leaf: 20, l2_regularization: 0.0, class_weight: null}
   extra_trees:
     fixed:
       n_estimators: 150
@@ -60,6 +83,22 @@ models:
       n_estimators: [200, 500]
       max_depth: [3, 6]
       learning_rate: [0.03, 0.1]
+    optuna:
+      trials: 100
+      space:
+        n_estimators: {type: int, low: 200, high: 1500}
+        learning_rate: {type: float, low: 0.005, high: 0.2, log: true}
+        max_depth: {type: int, low: 2, high: 8}
+        min_child_weight: {type: float, low: 1.0, high: 20.0, log: true}
+        gamma: {type: float, low: 0.0, high: 5.0}
+        subsample: {type: float, low: 0.6, high: 1.0}
+        colsample_bytree: {type: float, low: 0.6, high: 1.0}
+        reg_alpha: {type: float, low: 0.0, high: 5.0}
+        reg_lambda: {type: float, low: 0.01, high: 30.0, log: true}
+        scale_pos_weight: {type: float, low: 1.0, high: 3.5}
+      enqueue:
+        - variant: baseline
+          params: {n_estimators: 500, learning_rate: 0.03, max_depth: 6, min_child_weight: 1.0, gamma: 0.0, subsample: 0.8, colsample_bytree: 0.8, reg_alpha: 0.0, reg_lambda: 1.0, scale_pos_weight: 1.0}
   catboost:
     fixed:
       loss_function: Logloss
@@ -72,6 +111,18 @@ models:
       iterations: [200, 500]
       depth: [4, 6]
       learning_rate: [0.03, 0.1]
+    optuna:
+      trials: 100
+      space:
+        iterations: {type: int, low: 200, high: 1500}
+        learning_rate: {type: float, low: 0.005, high: 0.2, log: true}
+        depth: {type: int, low: 3, high: 8}
+        l2_leaf_reg: {type: float, low: 0.1, high: 30.0, log: true}
+        random_strength: {type: float, low: 0.0, high: 5.0}
+        auto_class_weights: {type: categorical, choices: [null, Balanced]}
+      enqueue:
+        - variant: baseline
+          params: {iterations: 500, learning_rate: 0.1, depth: 4, l2_leaf_reg: 3.0, random_strength: 1.0, auto_class_weights: null}
   lightgbm:
     fixed:
       objective: binary
@@ -90,3 +141,18 @@ models:
       n_estimators: [200, 500]
       num_leaves: [15, 31]
       learning_rate: [0.03, 0.1]
+    optuna:
+      trials: 100
+      space:
+        n_estimators: {type: int, low: 200, high: 1500}
+        learning_rate: {type: float, low: 0.005, high: 0.2, log: true}
+        num_leaves: {type: int, low: 8, high: 63}
+        min_child_samples: {type: int, low: 10, high: 100}
+        subsample: {type: float, low: 0.6, high: 1.0}
+        colsample_bytree: {type: float, low: 0.6, high: 1.0}
+        reg_alpha: {type: float, low: 0.0, high: 5.0}
+        reg_lambda: {type: float, low: 0.01, high: 30.0, log: true}
+        class_weight: {type: categorical, choices: [null, balanced]}
+      enqueue:
+        - variant: interactions
+          params: {n_estimators: 500, learning_rate: 0.03, num_leaves: 15, min_child_samples: 20, subsample: 0.8, colsample_bytree: 0.8, reg_alpha: 0.0, reg_lambda: 1.0, class_weight: null}
