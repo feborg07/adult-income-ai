@@ -1352,3 +1352,135 @@ def test_training_rejects_reference_as_output_directory(
         match="separate from models/reference",
     ):
         training.train(args)
+
+
+# ============================================================
+# 17. Independent training scope and search strategy
+# ============================================================
+
+@pytest.mark.parametrize("quick,search,expected", [
+    (True, None, "first"), (False, None, "grid"),
+    (True, "grid", "grid"), (False, "first", "first"),
+])
+def test_search_strategy_independent_of_mode(quick, search, expected):
+    config = training.load_training_config()
+    effective, strategy = training.resolve_training_scope(
+        config, Namespace(quick=quick, search=search)
+    )
+    assert strategy == expected
+    assert effective == config
+
+
+def test_scope_preserves_yaml_order_and_configuration():
+    config = training.load_training_config()
+    original = copy.deepcopy(config)
+    args = Namespace(quick=True, models=["extra_trees", "logistic_regression"],
+                     variants=["robust", "baseline"], search="grid")
+    effective, strategy = training.resolve_training_scope(config, args)
+    assert list(effective["models"]) == ["logistic_regression", "extra_trees"]
+    assert effective["variants"] == ["baseline", "robust"]
+    assert strategy == "grid"
+    assert config == original
+    specs = training.candidates(strategy == "first", config=effective)
+    assert len(specs) == sum(
+        prod(len(values) for values in spec["grid"].values())
+        for spec in effective["models"].values()
+    )
+
+
+@pytest.mark.parametrize("overrides", [
+    {"models": ["not_registered"]},
+    {"models": ["extra_trees", "extra_trees"]},
+    {"variants": ["not_available"]},
+    {"variants": ["baseline", "baseline"]},
+    {"models": []}, {"variants": []}, {"search": "optuna"},
+])
+def test_scope_rejects_invalid_selection(overrides):
+    config = training.load_training_config()
+    with pytest.raises(ValueError):
+        training.resolve_training_scope(config, Namespace(quick=True, **overrides))
+
+
+def test_yaml_accepts_registered_model_subset(tmp_path):
+    import yaml
+    config = training.load_training_config()
+    config["models"] = {"extra_trees": config["models"]["extra_trees"]}
+    path = tmp_path / "subset.yml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    loaded = training.load_training_config(path)
+    assert list(loaded["models"]) == ["extra_trees"]
+    with pytest.raises(ValueError, match="Unavailable models"):
+        training.resolve_training_scope(
+            loaded, Namespace(quick=True, models=["random_forest"])
+        )
+
+
+@pytest.mark.parametrize("models", [{}, {"unknown": {}}])
+def test_yaml_rejects_invalid_model_registry(tmp_path, models):
+    import yaml
+    config = training.load_training_config()
+    config["models"] = models
+    path = tmp_path / "invalid.yml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    with pytest.raises(ValueError):
+        training.load_training_config(path)
+
+
+def test_cli_parses_scope(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["train", "--quick", "--models", "extra_trees",
+                                    "--variants", "robust", "--search", "grid"])
+    args = training.parse_args()
+    assert args.quick
+    assert args.models == ["extra_trees"]
+    assert args.variants == ["robust"]
+    assert args.search == "grid"
+
+
+def test_quick_grid_uses_selected_scope_without_test_evaluation(
+    training_workspace, isolated_mlflow, monkeypatch
+):
+    args = training_workspace["args"]
+    args.models = ["logistic_regression"]
+    args.variants = ["robust"]
+    args.search = "grid"
+    config = training.load_training_config()
+    expected = prod(len(v) for v in config["models"]["logistic_regression"]["grid"].values())
+    original_load = training.load_variant
+    original_predict = Pipeline.predict_proba
+    original_evaluate = training.evaluate
+    held_out = []
+
+    def tracked_load(*args, **kwargs):
+        dataset = original_load(*args, **kwargs)
+        held_out.append(dataset)
+        return dataset
+
+    def guarded_predict(self, X, *args, **kwargs):
+        assert all(X is not data.X_test for data in held_out)
+        return original_predict(self, X, *args, **kwargs)
+
+    def guarded_evaluate(y, probabilities, threshold):
+        assert all(y is not data.y_test for data in held_out)
+        return original_evaluate(y, probabilities, threshold)
+
+    monkeypatch.setattr(training, "load_variant", tracked_load)
+    monkeypatch.setattr(Pipeline, "predict_proba", guarded_predict)
+    monkeypatch.setattr(training, "evaluate", guarded_evaluate)
+    before = create_reference_artifacts(training_workspace)
+    run_dir, summary = run_training(training_workspace, quick=True)
+    assert summary["candidate_count"] == expected
+    assert summary["successful_candidates"] == expected
+    assert summary["scope"] == {"models": ["logistic_regression"],
+                                "variants": ["robust"], "search": "grid"}
+    assert set(summary["winners"]) == {"robust"}
+    assert "test" not in summary["winners"]["robust"]
+    assert not (run_dir / "best_model_pipeline.joblib").exists()
+    assert not (run_dir / "robust").exists()
+    assert reference_hashes(training_workspace) == before
+    experiment = mlflow.get_experiment_by_name(args.experiment)
+    runs = mlflow.search_runs(experiment_ids=[experiment.experiment_id])
+    assert len(runs) == expected
+    assert set(runs["tags.mode"]) == {"quick"}
+    assert set(runs["tags.search_strategy"]) == {"grid"}
+    assert set(runs["tags.model_family"]) == {"logistic_regression"}
+    assert set(runs["tags.preprocessing_variant"]) == {"robust"}

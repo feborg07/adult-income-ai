@@ -100,6 +100,14 @@ VARIANTS = (
 
 SEED = 42
 
+# Single registry of supported classifier families.
+MODEL_REGISTRY = {
+    "logistic_regression": LogisticRegression,
+    "random_forest": RandomForestClassifier,
+    "hist_gradient_boosting": HistGradientBoostingClassifier,
+    "extra_trees": ExtraTreesClassifier,
+}
+
 
 # ============================================================
 # 2. Dataset container
@@ -266,12 +274,13 @@ def load_training_config(path: Path | None = None) -> dict:
         raise ValueError("variants must be a nonempty list.")
     if not set(config["variants"]).issubset(VARIANTS):
         raise ValueError(f"Unsupported preprocessing variant: {config['variants']}")
-    required_models = {
-        "logistic_regression", "random_forest",
-        "hist_gradient_boosting", "extra_trees",
-    }
-    if set(config["models"]) != required_models:
-        raise ValueError(f"models must contain exactly: {sorted(required_models)}")
+    if len(set(config["variants"])) != len(config["variants"]):
+        raise ValueError("Duplicate preprocessing variants are not allowed.")
+    if not isinstance(config["models"], dict) or not config["models"]:
+        raise ValueError("models must be a nonempty mapping.")
+    unsupported = set(config["models"]) - MODEL_REGISTRY.keys()
+    if unsupported:
+        raise ValueError(f"Unsupported model families: {sorted(unsupported)}")
     for name, spec in config["models"].items():
         if not isinstance(spec, dict) or not isinstance(spec.get("fixed"), dict):
             raise ValueError(f"{name}: fixed must be a mapping.")
@@ -291,16 +300,45 @@ def load_training_config(path: Path | None = None) -> dict:
     return config
 
 
+def resolve_training_scope(config: dict, args) -> tuple[dict, str]:
+    """Resolve CLI scope without mutating the source YAML configuration.
+
+    Preserve YAML ordering so deterministic candidate tie-breaking remains
+    unchanged, regardless of the order of CLI selection arguments.
+    """
+    effective = dict(config)
+    for key in ("models", "variants"):
+        available = config[key]
+        requested = getattr(args, key, None)
+        if requested is None:
+            continue
+        if not requested or len(set(requested)) != len(requested):
+            raise ValueError(f"{key} selection must be nonempty and unique.")
+        unknown = set(requested) - set(available)
+        if unknown:
+            raise ValueError(f"Unavailable {key}: {sorted(unknown)}")
+        effective[key] = (
+            {name: spec for name, spec in available.items() if name in requested}
+            if key == "models"
+            else [name for name in available if name in requested]
+        )
+
+    # Search depth is independent of test evaluation and packaging permissions.
+    search = getattr(args, "search", None)
+    if search is None:
+        search = "first" if args.quick else "grid"
+    if search not in ("first", "grid"):
+        raise ValueError(f"Unsupported search strategy: {search}")
+    return effective, search
+
+
 def candidates(quick: bool = False, config: dict | None = None):
-    """Build sklearn candidates from the YAML Cartesian hyperparameter grids."""
+    """Enumerate YAML candidates; quick=True selects the first grid entry.
+
+    This argument controls enumeration only, not test evaluation or promotion.
+    """
     config = load_training_config() if config is None else config
     seed = config["seed"]
-    classes = {
-        "logistic_regression": LogisticRegression,
-        "random_forest": RandomForestClassifier,
-        "hist_gradient_boosting": HistGradientBoostingClassifier,
-        "extra_trees": ExtraTreesClassifier,
-    }
     specs = []
     for family, spec in config["models"].items():
         grid = spec["grid"]
@@ -308,7 +346,7 @@ def candidates(quick: bool = False, config: dict | None = None):
         combinations = product(*(grid[key] for key in keys))
         for values in combinations:
             params = dict(zip(keys, values))
-            estimator = classes[family](
+            estimator = MODEL_REGISTRY[family](
                 **spec["fixed"], **params, random_state=seed
             )
             if family == "logistic_regression":
@@ -631,7 +669,13 @@ def train(args):
     """
 
     config = load_training_config(getattr(args, "config", None))
+    config, search = resolve_training_scope(config, args)
     active_variants = config["variants"]
+    scope = {
+        "models": list(config["models"]),
+        "variants": list(active_variants),
+        "search": search,
+    }
     processed = args.processed_dir.resolve()
     preprocessor_dir = args.preprocessor_dir.resolve()
     # Each invocation owns a unique directory, including quick runs.
@@ -672,7 +716,8 @@ def train(args):
     leaderboard = []
     winners = {}
 
-    specifications = candidates(args.quick, config=config)
+    # The mode governs safety; the search strategy governs enumeration.
+    specifications = candidates(search == "first", config=config)
 
     LOG.info(
         "Training %s candidates across %s variants",
@@ -713,12 +758,16 @@ def train(args):
                     # Preserve the candidate's original evaluation order for
                     # deterministic tie-breaking in MLflow comparisons.
                     "candidate_index": str(len(leaderboard)),
+                    "search_strategy": search,
                 })
 
                 mlflow.log_params({
                     "variant": variant,
                     "model": family,
                     "config_sha256": config_sha256,
+                    "search_strategy": search,
+                    "selected_models": json.dumps(scope["models"]),
+                    "selected_variants": json.dumps(scope["variants"]),
                     "data_version": file_sha256(processed / variant / "X_train.csv"),
                     "seed": config["seed"],
                     **{f"fixed_{k}": str(v) for k, v in config["models"][family]["fixed"].items()},
@@ -973,6 +1022,7 @@ def train(args):
         "output_dir": str(output),
         "preferred_variant_by_validation": preferred,
         "quick": args.quick,
+        "scope": scope,
         "config_sha256": config_sha256,
         "candidate_count": len(leaderboard),
         "successful_candidates": sum(
@@ -1201,6 +1251,7 @@ def train(args):
             "model_filename": candidate_model.name,
             "model_sha256": file_sha256(candidate_model),
             "training_mode": "quick" if args.quick else "full",
+            "scope": scope,
         }
         atomic_json_write(candidate_metadata, metadata)
 
@@ -1266,10 +1317,29 @@ def parse_args():
     parser.add_argument("--mlflow-db", type=Path, default=None)
     parser.add_argument("--mlflow-artifacts", type=Path, default=None)
     parser.add_argument("--experiment", default=None)
-    parser.add_argument("--quick", action="store_true")
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="Development mode: validation only; never package a promotion candidate.",
+    )
+    parser.add_argument(
+        "--models", nargs="+", choices=tuple(MODEL_REGISTRY),
+        help="Select model families enabled in the YAML configuration.",
+    )
+    parser.add_argument(
+        "--variants", nargs="+", choices=VARIANTS,
+        help="Select preprocessing variants enabled in the YAML configuration.",
+    )
+    parser.add_argument(
+        "--search", choices=("first", "grid"), default=None,
+        help="Search depth (default: first in quick mode, grid in full mode).",
+    )
     parser.add_argument("--show-mlflow-command", action="store_true")
     args = parser.parse_args()
     config = load_training_config(args.config)
+    try:
+        resolve_training_scope(config, args)
+    except ValueError as exc:
+        parser.error(str(exc))
     # Resolve relative paths against repository root, not the shell's cwd.
     for attr in ("processed_dir", "preprocessor_dir", "output_dir",
                  "mlflow_db", "mlflow_artifacts"):
