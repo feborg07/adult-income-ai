@@ -8,8 +8,8 @@ Stages:
     1. Restore DVC artifacts (optional)
     2. Run automated tests
     3. Preprocess datasets
-    4. Train candidate models
-    5. Compare MLflow candidates (full mode only)
+    4. Run training-only CV candidate search
+    5. Compare MLflow CV candidates (full mode only)
     6. Generate synthetic drift datasets
     7. Monitor data drift
     8. Evaluate reference model robustness
@@ -24,6 +24,8 @@ Notes:
     - Critical drift is expected during the severe stress test.
     - All stages run sequentially.
     - The pipeline stops when a required stage fails.
+    - Both modes use validation-only CV; full means the complete configured grid.
+    - Only the frozen reference is scored during the robustness stress test.
     - Full-mode comparison uses only candidates from the current execution.
 """
 
@@ -141,7 +143,7 @@ def run_stage(
 
 
 # ============================================================
-# Full-training execution discovery
+# CV execution discovery
 # ============================================================
 
 def training_runs_directory() -> Path:
@@ -178,27 +180,34 @@ def execution_ids(output_dir: Path) -> set[str]:
     }
 
 
-def new_full_execution_id(output_dir: Path, previous_ids: set[str]) -> str:
-    """Identify and verify the one full run produced by this training stage."""
+def new_cv_execution_id(output_dir: Path, previous_ids: set[str]) -> str:
+    """Identify and verify the new validation-only CV grid execution."""
     created_ids = execution_ids(output_dir) - previous_ids
     if len(created_ids) != 1:
         raise RuntimeError(
-            "Expected exactly one new full-training execution directory; "
+            "Expected exactly one new CV execution directory; "
             f"found {len(created_ids)} under {output_dir}."
         )
 
     execution_id = created_ids.pop()
-    summary_path = output_dir / execution_id / "training_summary.json"
+    summary_path = output_dir / execution_id / "cv_training_summary.json"
     if not summary_path.is_file():
-        raise RuntimeError(f"Full-training summary missing: {summary_path}")
+        raise RuntimeError(f"CV training summary missing: {summary_path}")
 
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Unable to read training summary: {summary_path}") from exc
 
-    if summary.get("execution_id") != execution_id or summary.get("quick") is not False:
-        raise RuntimeError("Training summary does not match the new full execution.")
+    if (not isinstance(summary, dict)
+            or summary.get("execution_id") != execution_id
+            or summary.get("quick") is not True
+            or summary.get("evaluation_protocol") != "cv"
+            or not isinstance(summary.get("scope"), dict)
+            or summary["scope"].get("search") != "grid"
+            or not isinstance(summary.get("successful_candidates"), int)
+            or summary["successful_candidates"] <= 0):
+        raise RuntimeError("Training summary does not match the new CV grid execution.")
 
     return execution_id
 
@@ -217,7 +226,7 @@ def run_pipeline(
     Parameters
     ----------
     training_mode:
-        'quick' or 'full'.
+        'quick' (first configuration) or 'full' (complete grid), both with CV.
 
     pull_dvc:
         Whether to retrieve DVC artifacts before execution.
@@ -225,7 +234,7 @@ def run_pipeline(
 
     if training_mode not in {"quick", "full"}:
         raise ValueError(
-            "training_mode must be 'quick' or 'full'."
+            "training_mode must be 'quick' (first configuration) or 'full' (complete grid), both with CV."
         )
 
     python = sys.executable
@@ -312,11 +321,12 @@ def run_pipeline(
         python,
         "-m",
         "src.models.train",
+        "--mode", "validation",
+        "--evaluation", "cv",
+        "--search", "first" if training_mode == "quick" else "grid",
     ]
 
-    if training_mode == "quick":
-        training_command.append("--quick")
-    else:
+    if training_mode == "full":
         # Snapshot the YAML-configured output directory immediately before
         # training. This is reliable even when historical runs exist.
         runs_dir = training_runs_directory()
@@ -334,9 +344,9 @@ def run_pipeline(
     # --------------------------------------------------------
 
     if training_mode == "full":
-        execution_id = new_full_execution_id(runs_dir, previous_ids)
+        execution_id = new_cv_execution_id(runs_dir, previous_ids)
         comparison_path = PROJECT_ROOT / "reports" / "mlflow_comparison.csv"
-        LOGGER.info("Full-training execution ID: %s", execution_id)
+        LOGGER.info("CV grid execution ID: %s", execution_id)
 
         results.append(
             run_stage(
@@ -346,7 +356,9 @@ def run_pipeline(
                     "-m",
                     "scripts.compare_experiments",
                     "--mode",
-                    "full",
+                    "validation",
+                    "--evaluation",
+                    "cv",
                     "--execution-id",
                     execution_id,
                     "--output",
@@ -463,13 +475,13 @@ def main() -> int:
     mode.add_argument(
         "--quick",
         action="store_true",
-        help="Run quick model training (default).",
+        help="Run first-configuration validation-only CV (default).",
     )
 
     mode.add_argument(
         "--full",
         action="store_true",
-        help="Run the complete model search.",
+        help="Run the complete configured CV grid (validation-only).",
     )
 
     parser.add_argument(

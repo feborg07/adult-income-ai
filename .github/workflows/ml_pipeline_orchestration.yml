@@ -1,12 +1,12 @@
 # Manual end-to-end orchestration. The automatic two-job CI workflow is ci.yml.
-# Quick training is a smoke check; only full training creates a promotable candidate.
+# Both modes use validation-only CV; promotion is a separate approval workflow.
 name: MLOps Pipeline Orchestration
 
 on:
   workflow_dispatch:
     inputs:
       training_mode:
-        description: "Quick smoke check or full model experiment"
+        description: "Quick CV smoke check or full CV grid search"
         required: true
         default: "quick"
         type: choice
@@ -70,6 +70,7 @@ jobs:
       #    training, drift generation, monitoring and robustness evaluation.
       #    It handles the expected CRITICAL alert for synthetic severe drift.
       #    Neither mode promotes or updates the DVC reference model.
+      #    Candidate search uses training-only CV; robustness scores the fixed reference.
       - name: Run MLOps pipeline
         env:
           TRAINING_MODE: ${{ inputs.training_mode }}
@@ -91,12 +92,13 @@ jobs:
             echo "- Orchestration: scripts/run_pipeline.py"
             echo "- Git revision: $GITHUB_SHA"
             echo "- Reference model promotion: disabled"
+            echo "- Candidate evaluation: training-only CV"
             if [[ "$TRAINING_MODE" == "full" ]]; then
               echo "- MLflow leaderboard: reports/mlflow_comparison.csv"
             else
-              echo "- Quick training: smoke check only; no promotable candidate"
+              echo "- Quick training: first-configuration CV smoke check"
             fi
-            echo "- Drift and robustness: reference model; see uploaded reports"
+            echo "- Drift: raw dataset; robustness: fixed promoted reference; see uploaded reports"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # 6. Preserve per-execution artifacts. The SQLite MLflow database is
