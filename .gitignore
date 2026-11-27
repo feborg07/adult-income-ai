@@ -137,3 +137,6 @@ htmlcov/
 /.dvc/cache/
 /.dvc/tmp/
 /.dvc/config.local
+
+# Local reference rollback history (publish reference versions through DVC).
+/models/reference_history/
