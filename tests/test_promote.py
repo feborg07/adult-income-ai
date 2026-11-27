@@ -149,7 +149,8 @@ def test_confirmed_promotion(env):
     assert meta['model_family']=='any_algorithm' and meta['decision_threshold']==.35
     assert meta['required_features']==['age','sex'] and meta['educational_use_only']
     assert meta['approval_sha256']==result['approval_sha256'] and 'fairness' in meta['evidence']
-    assert set(x.name for x in env.ref.iterdir())=={p.MODEL_FILENAME,p.METADATA_FILENAME}
+    assert set(x.name for x in env.ref.iterdir())=={p.MODEL_FILENAME,p.METADATA_FILENAME,'evaluation'}
+    p.verify_evaluation_bundle(env.ref/'evaluation', meta)
 
 
 @pytest.mark.parametrize('approval',[None,'0'*64])
@@ -328,3 +329,22 @@ def test_staging_copy_failure(env,monkeypatch):
         confirm(env)
     assert p.load_json(env.ref/p.METADATA_FILENAME)==env.old
     assert not (env.root/'models/reference_history/.promotion.lock').exists()
+
+
+def test_pending_backup_blocks_new_promotion(env):
+    """Require finalization of the prior release before replacing its successor."""
+    pending = env.root / 'models/reference_history' / ('f' * 32) / 'reference'
+    pending.mkdir(parents=True)
+    with pytest.raises(ValueError, match='Pending rollback transaction'):
+        confirm(env)
+    assert pending.exists()
+    assert p.load_json(env.ref / p.METADATA_FILENAME) == env.old
+
+
+def test_missing_pointer_blocks_promotion(env):
+    """Require a recoverable previous DVC pointer before reference replacement."""
+    (env.root / 'models/reference.dvc').unlink()
+    with pytest.raises(ValueError, match='reference DVC pointer'):
+        confirm(env)
+    assert p.load_json(env.ref / p.METADATA_FILENAME) == env.old
+    assert not list((env.root / 'models/reference_history').iterdir())

@@ -234,11 +234,63 @@ def build_reference_metadata(candidate, selected, evidence, approval, required):
                 evidence=evidence)
 
 
+# The standalone files are derived from the approved embedded evidence.
+EVALUATION_FILES = {
+    'validation.json': 'summary',
+    'frozen_plan.json': 'plan',
+    'partition_identity.json': 'identity',
+    'heldout.json': 'heldout',
+    'fairness.json': 'fairness',
+    'robustness.json': 'robustness',
+    'drift.json': 'drift',
+    'previous_reference.json': 'previous_reference',
+}
+
+
+def evaluation_payloads(metadata):
+    """Derive a release bundle only from the approved promotion record."""
+    evidence = metadata['evidence']
+    require(canonical_sha(evidence) == metadata['approval_sha256'], 'Approved evidence digest mismatch')
+    return {filename: evidence[key] for filename, key in EVALUATION_FILES.items()}
+
+
+def write_evaluation_bundle(directory, metadata):
+    """Write evidence and a byte-level manifest to a new staging directory."""
+    payloads = evaluation_payloads(metadata)
+    directory.mkdir(exist_ok=False)
+    for filename, value in payloads.items():
+        (directory / filename).write_text(json.dumps(value, indent=2, allow_nan=False), encoding='utf-8')
+    manifest = dict(schema_version=1, model_sha256=metadata['model_sha256'],
+                    approval_sha256=metadata['approval_sha256'],
+                    files={name: sha256_file(directory / name) for name in payloads})
+    (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    verify_evaluation_bundle(directory, metadata)
+
+
+def verify_evaluation_bundle(directory, metadata):
+    """Check exact file membership, byte hashes and approved JSON contents."""
+    payloads = evaluation_payloads(metadata)
+    require(directory.is_dir() and not directory.is_symlink(), 'Missing or unsafe evaluation directory')
+    require({p.name for p in directory.iterdir()} == set(payloads) | {'manifest.json'},
+            'Unexpected evaluation bundle contents')
+    require(all(p.is_file() and not p.is_symlink() for p in directory.iterdir()), 'Unsafe evaluation file')
+    manifest = load_json(directory / 'manifest.json')
+    require(manifest == dict(schema_version=1, model_sha256=metadata['model_sha256'],
+                            approval_sha256=metadata['approval_sha256'],
+                            files={name: sha256_file(directory / name) for name in payloads}),
+            'Evaluation manifest mismatch')
+    for filename, value in payloads.items():
+        require(canonical_sha(load_json(directory / filename)) == canonical_sha(value),
+                f'Approved evaluation content mismatch: {filename}')
+
+
 def install_reference(root, source, metadata, previous):
     """Stage the new directory, retain the previous version and recover on exceptions."""
     reference = root / 'models/reference'
     history = root / 'models/reference_history'
     history.mkdir(parents=True, exist_ok=True)
+    require(not history.is_symlink() and not getattr(history, 'is_junction', lambda: False)(),
+            'Unsafe rollback history directory')
     lock = history / '.promotion.lock'
     lock.mkdir()  # Concurrent promotion or unresolved interruption fails closed.
     transaction = history / uuid.uuid4().hex
@@ -247,6 +299,9 @@ def install_reference(root, source, metadata, previous):
     keep_lock = False
     try:
         (lock / 'transaction').write_text(transaction.name, encoding='utf-8')
+        # Finish publication and recovery of previous promotions first.
+        require(not any(p != lock for p in history.iterdir()),
+                'Pending rollback transaction; finalize the previous release first')
         # Recheck the old version before any replacement.
         require(load_json(reference / METADATA_FILENAME) == previous, 'Reference metadata changed during promotion')
         verify_hash(reference / MODEL_FILENAME, previous['model_sha256'])
@@ -254,15 +309,17 @@ def install_reference(root, source, metadata, previous):
         shutil.copy2(source, staged / MODEL_FILENAME)
         verify_hash(staged / MODEL_FILENAME, metadata['model_sha256'])
         (staged / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2, allow_nan=False), encoding='utf-8')
+        write_evaluation_bundle(staged / 'evaluation', metadata)
         pointer = root / 'models/reference.dvc'
-        if pointer.exists():
-            shutil.copy2(pointer, transaction / 'reference.dvc')
+        require(pointer.is_file() and not pointer.is_symlink(), 'Missing or unsafe reference DVC pointer')
+        shutil.copy2(pointer, transaction / 'reference.dvc')
         # Preserve the old directory intact; never write through DVC-linked files.
         try:
             os.rename(reference, backup)
             os.rename(staged, reference)
             verify_hash(reference / MODEL_FILENAME, metadata['model_sha256'])
             require(load_json(reference / METADATA_FILENAME) == metadata, 'Installed metadata mismatch')
+            verify_evaluation_bundle(reference / 'evaluation', metadata)
         except BaseException:
             if backup.exists():
                 # Keep the recovery lock if rollback itself cannot complete.
@@ -276,6 +333,9 @@ def install_reference(root, source, metadata, previous):
     finally:
         # Hard termination or failed rollback leaves a transaction marker for recovery.
         if not keep_lock:
+            # A failed staging operation or successful rollback leaves no backup to publish.
+            if transaction.exists() and not backup.exists() and reference.exists() and not (transaction / 'failed_reference').exists():
+                shutil.rmtree(transaction)
             (lock / 'transaction').unlink(missing_ok=True)
             lock.rmdir()
 
