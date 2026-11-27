@@ -29,7 +29,7 @@ def test_optuna_cli_accepts_validation(monkeypatch, options):
     args = training.parse_args()
     config, search = training.resolve_training_scope(training.load_training_config(), args)
     assert args.quick and args.evaluation == "cv" and search == "optuna"
-    assert set(config["models"]) == {"lightgbm", "xgboost", "catboost", "hist_gradient_boosting"}
+    assert set(config["models"]) == {name for name, spec in training.load_training_config()["models"].items() if "optuna" in spec}
 
 
 @pytest.mark.parametrize("options", [
@@ -39,8 +39,6 @@ def test_optuna_cli_accepts_validation(monkeypatch, options):
     ["--quick", "--evaluation", "cv", "--search", "grid", "--trials", "2"],
     ["--quick", "--evaluation", "cv", "--search", "optuna", "--trials", "0"],
     ["--quick", "--evaluation", "cv", "--search", "optuna", "--trials", "-1"],
-    ["--quick", "--evaluation", "cv", "--search", "optuna", "--models", "random_forest"],
-    ["--quick", "--evaluation", "cv", "--search", "optuna", "--models", "lightgbm", "extra_trees"],
 ])
 def test_invalid_optuna_cli(monkeypatch, options):
     """Reject unsupported modes, budgets and algorithm selections before fitting."""
@@ -59,7 +57,8 @@ def test_optuna_yaml_scope_and_budget_defaults(optuna_workspace, tracked_mlflow,
     monkeypatch.setattr(training, "run_cv_search", runner)
     training.train(args)
     scope = runner.call_args.args[1]
-    assert scope["trial_budgets"] == {"hist_gradient_boosting": 50, "lightgbm": 100}
+    defaults = training.load_training_config()["models"]
+    assert scope["trial_budgets"] == {name: defaults[name]["optuna"]["trials"] for name in args.models}
     assert scope["variants"] == ["baseline"]
     args.trials = 2
     training.train(args)
@@ -153,3 +152,16 @@ def test_optuna_budget_is_per_family(optuna_workspace, tracked_mlflow):
     assert set(rows.optuna_trial_number) == {0}
     assert set(rows.variant) == {"baseline", "interactions"}
     assert all(study["completed"] == 1 for study in summary["optuna_studies"].values())
+    assert set(summary["optuna_contexts"]) == set(args.models)
+    assert len({entry["id"] for entry in summary["optuna_contexts"].values()}) == 2
+    assert "optuna_context_id" not in summary
+
+
+@pytest.mark.parametrize("family", ["random_forest", "extra_trees", "logistic_regression"])
+def test_extended_optuna_cli(monkeypatch, family):
+    """Accept each added family with its own default cumulative budget."""
+    monkeypatch.setattr("sys.argv", ["train", "--mode", "validation", "--evaluation", "cv", "--search", "optuna", "--models", family])
+    args = training.parse_args()
+    config, search = training.resolve_training_scope(training.load_training_config(), args)
+    assert search == "optuna" and set(config["models"]) == {family}
+    assert config["models"][family]["optuna"]["trials"] > 0

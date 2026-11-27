@@ -1,0 +1,58 @@
+# hist_gradient_boosting: fixed parameters, grid, and adaptive search.
+# order preserves historical grid enumeration.
+order: 20
+fixed:
+  max_iter: 150
+grid:
+  learning_rate:
+  - 0.05
+  - 0.1
+  max_leaf_nodes:
+  - 15
+  - 31
+optuna:
+  trials: 50
+  space:
+    max_iter:
+      type: int
+      low: 100
+      high: 800
+    learning_rate:
+      type: float
+      low: 0.005
+      high: 0.2
+      log: true
+    max_leaf_nodes:
+      type: int
+      low: 8
+      high: 63
+    min_samples_leaf:
+      type: int
+      low: 10
+      high: 100
+    l2_regularization:
+      type: float
+      low: 0.0
+      high: 10.0
+    class_weight:
+      type: categorical
+      choices:
+      - null
+      - balanced
+  enqueue:
+  - variant: baseline
+    params:
+      max_iter: 150
+      learning_rate: 0.05
+      max_leaf_nodes: 31
+      min_samples_leaf: 20
+      l2_regularization: 0.0
+      class_weight: null
+  - variant: baseline
+    params:
+      max_iter: 150
+      learning_rate: 0.1
+      max_leaf_nodes: 15
+      min_samples_leaf: 20
+      l2_regularization: 0.0
+      class_weight: null

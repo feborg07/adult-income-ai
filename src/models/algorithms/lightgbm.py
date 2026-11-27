@@ -10,6 +10,7 @@ class LightGBMAlgorithm(SklearnAlgorithm):
     """Build LightGBM classifiers and retain the probability prediction API."""
 
     name = "lightgbm"
+    registration_order = 60
     estimator_class = LGBMClassifier
     required_packages = (
         "lightgbm", "scikit-learn", "numpy", "scipy", "pandas", "skops",

@@ -14,6 +14,7 @@ class LogisticRegressionAlgorithm(SklearnAlgorithm):
     """Linear classifier with additional feature scaling."""
 
     name = "logistic_regression"
+    registration_order = 0
     estimator_class = LogisticRegression
 
     def build(

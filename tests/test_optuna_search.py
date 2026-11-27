@@ -7,6 +7,7 @@ import optuna
 from optuna.trial import TrialState
 import pytest
 import yaml
+from src.models.configuration import load_resolved_config
 
 from src.models.search.optuna_search import CandidateEvaluationError, run_optuna_search
 
@@ -14,7 +15,7 @@ from src.models.search.optuna_search import CandidateEvaluationError, run_optuna
 @pytest.fixture
 def config():
     """Load the actual YAML search spaces, leaving the repository unchanged."""
-    return yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/config.yml").read_text(encoding="utf-8"))
+    return load_resolved_config(Path(__file__).resolve().parents[1] / "configs/config.yml")
 
 
 def make_study(config, **kwargs):
@@ -31,7 +32,8 @@ def constant_score(candidate):
     return 0.72
 
 
-@pytest.mark.parametrize("family", ["lightgbm", "xgboost", "catboost", "hist_gradient_boosting"])
+@pytest.mark.parametrize("family", [name for name, spec in load_resolved_config(
+    Path(__file__).resolve().parents[1] / "configs/config.yml")["models"].items() if spec.get("optuna", {}).get("enqueue")])
 def test_warm_start_and_effective_parameters(config, family):
     """Use each family's exact YAML warm start and merge fixed overrides."""
     before = copy.deepcopy(config)
@@ -198,6 +200,7 @@ def test_invalid_variants(config, variants):
 
 def test_missing_family_space(config):
     """Do not invent an Optuna search space for an unconfigured algorithm."""
+    config["models"]["logistic_regression"].pop("optuna")
     with pytest.raises(ValueError, match="No Optuna search space"):
         run_optuna_search(make_study(config), config, "logistic_regression", config["variants"], constant_score, context_id="v1", trials=1)
 

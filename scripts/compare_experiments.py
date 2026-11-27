@@ -93,6 +93,13 @@ def validate_cv_comparability(runs: pd.DataFrame) -> None:
                 "Use --execution-id to compare one compatible execution."
             )
 
+    column = "params.effective_preprocessing_sha256"
+    if column in runs and runs[column].notna().any():
+        if runs[column].isna().any() or runs[column].astype(str).str.strip().eq("").any():
+            raise ValueError(f"Missing CV comparison metadata: {column}.")
+        if runs.groupby("tags.preprocessing_variant")[column].nunique().gt(1).any():
+            raise ValueError(f"Incompatible CV comparison metadata: {column} within a variant.")
+
 
 def rank_candidates(
     runs: pd.DataFrame,
@@ -100,6 +107,7 @@ def rank_candidates(
     mode: str | None = None,
     variant: str | None = None,
     execution_id: str | None = None,
+    execution_ids: list[str] | None = None,
     variant_order: list[str] | None = None,
     evaluation: str = "holdout",
 ) -> pd.DataFrame:
@@ -150,10 +158,13 @@ def rank_candidates(
         result = result.loc[result["tags.mode"] == mode]
     if variant is not None:
         result = result.loc[result["tags.preprocessing_variant"] == variant]
-    if execution_id is not None:
+    if execution_id is not None and execution_ids is not None:
+        raise ValueError("Specify only one execution filter.")
+    selected_ids = execution_ids if execution_ids is not None else ([execution_id] if execution_id is not None else None)
+    if selected_ids is not None:
         if "tags.training_execution_id" not in result.columns:
             return pd.DataFrame(columns=columns)
-        result = result.loc[result["tags.training_execution_id"] == execution_id]
+        result = result.loc[result["tags.training_execution_id"].isin(selected_ids)]
 
     result[metric] = pd.to_numeric(result[metric], errors="coerce")
     result = result.loc[result[metric].between(0, 1, inclusive="both")]
@@ -168,6 +179,10 @@ def rank_candidates(
             result = result.loc[valid]
         else:
             result[tie_breaker] = result[tie_breaker].where(valid)
+    if selected_ids is not None and execution_ids is not None:
+        missing = set(selected_ids) - set(result["tags.training_execution_id"])
+        if missing:
+            raise ValueError(f"No valid candidates for selected executions: {sorted(missing)}")
     if evaluation == "cv" and not result.empty:
         validate_cv_comparability(result)
 
@@ -204,6 +219,7 @@ def compare(
     mode: str | None = None,
     variant: str | None = None,
     execution_id: str | None = None,
+    execution_ids: list[str] | None = None,
     output: Path | None = None,
     evaluation: str = "holdout",
 ) -> pd.DataFrame:
@@ -216,8 +232,12 @@ def compare(
         raise ValueError("CV comparisons require validation-only mode or all.")
     if top < 1:
         raise ValueError("--top must be at least 1")
-    if execution_id is not None and not EXECUTION_ID_RE.fullmatch(execution_id):
-        raise ValueError("--execution-id must be a 32-character lowercase hex ID")
+    if execution_id is not None and execution_ids is not None:
+        raise ValueError("Specify only one execution filter.")
+    selected_ids = execution_ids if execution_ids is not None else ([execution_id] if execution_id is not None else [])
+    if (any(not EXECUTION_ID_RE.fullmatch(value) for value in selected_ids)
+            or len(set(selected_ids)) != len(selected_ids) or execution_ids == []):
+        raise ValueError("--execution-id/--execution-ids requires unique 32-character lowercase hex IDs")
     experiment_name, db_path, variant_order = load_settings(config_path)
     if variant is not None and variant not in variant_order:
         raise ValueError(f"Unknown preprocessing variant: {variant}.")
@@ -240,6 +260,7 @@ def compare(
         mode=None if mode == "all" else mode,
         variant=variant,
         execution_id=execution_id,
+        execution_ids=execution_ids,
         variant_order=variant_order,
         evaluation=evaluation,
     )
@@ -265,6 +286,8 @@ def compare(
     print(f"Valid candidates: {len(ranked)}")
     if execution_id is not None:
         print(f"Execution ID: {execution_id}")
+    if execution_ids is not None:
+        print(f"Execution IDs: {', '.join(execution_ids)}")
     print(f"Best run: {ranked.iloc[0]['run_id']}")
     label = "mean CV F1" if evaluation == "cv" else "validation F1"
     print(f"Best {label}: {ranked.iloc[0][metric]:.4f}")
@@ -300,10 +323,12 @@ def main() -> int:
     )
     parser.add_argument("--evaluation", choices=("holdout", "cv"), default="holdout")
     parser.add_argument("--variant", help="Preprocessing variant defined in YAML")
-    parser.add_argument(
+    executions = parser.add_mutually_exclusive_group()
+    executions.add_argument(
         "--execution-id", type=str,
         help="Limit comparison to one training execution (32 hex characters)",
     )
+    executions.add_argument("--execution-ids", nargs="+", help="Compare an explicit cohort of training executions")
     parser.add_argument("--output", type=Path, help="Optional CSV leaderboard output")
     args = parser.parse_args()
     try:
@@ -313,6 +338,7 @@ def main() -> int:
             mode=args.mode,
             variant=args.variant,
             execution_id=args.execution_id,
+            execution_ids=args.execution_ids,
             output=args.output,
             evaluation=args.evaluation,
         )

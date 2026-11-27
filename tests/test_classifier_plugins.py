@@ -5,6 +5,7 @@ import joblib
 import numpy as np
 import pytest
 import yaml
+from src.models.configuration import load_resolved_config
 from sklearn.datasets import make_classification
 from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -22,7 +23,7 @@ LEGACY = {
 def config():
     """Load the production YAML configuration."""
     path = Path(__file__).resolve().parents[1] / 'configs/config.yml'
-    return yaml.safe_load(path.read_text(encoding='utf-8'))
+    return load_resolved_config(path)
 def legacy_model(family, params, seed):
     """Reproduce original estimator construction for regression checks."""
     estimator = LEGACY[family][0](**params, random_state=seed)

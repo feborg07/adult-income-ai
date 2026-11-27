@@ -159,3 +159,47 @@ def test_optuna_real_mlflow_persistence(optuna_workspace):
         if mlflow.active_run() is not None:
             mlflow.end_run()
         mlflow.set_tracking_uri(previous)
+
+
+def test_yaml_budget_and_unrelated_model_changes_preserve_study(optuna_workspace, tracked_mlflow, tmp_path):
+    """Resume a real SQLite study after unrelated edits and a larger YAML budget."""
+    import yaml
+
+    args, _, _ = optuna_workspace
+    use_hgb(args)
+    args.trials = None
+    config = training.load_training_config()
+    config["models"]["hist_gradient_boosting"]["optuna"]["trials"] = 2
+    args.config = tmp_path / "inline.yml"
+    args.config.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    first, _, _ = run_and_read(args)
+    # An unrelated model's settings must not invalidate the HGB study.
+    config["models"]["random_forest"]["optuna"]["trials"] = 51
+    config["models"]["random_forest"]["fixed"]["n_jobs"] = 2
+    config["models"]["hist_gradient_boosting"]["optuna"]["trials"] = 3
+    args.config.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    second, current, cumulative = run_and_read(args)
+    assert first["config_sha256"] != second["config_sha256"]
+    assert first["optuna_context_id"] == second["optuna_context_id"]
+    assert len(current) == 1 and len(cumulative) == 3
+    # A change to HGB's own search space must isolate the next experiment.
+    config["models"]["hist_gradient_boosting"]["optuna"]["space"]["max_iter"]["high"] += 1
+    args.config.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    args.trials = 1
+    third, current, cumulative = run_and_read(args)
+    assert third["optuna_context_id"] != second["optuna_context_id"]
+    assert len(current) == len(cumulative) == 1
+    assert third["fold_sha256"] == first["fold_sha256"]
+
+
+def test_family_code_identity_ignores_unrelated_plugin():
+    """Isolate algorithm source changes while retaining shared evaluator identity."""
+    from copy import deepcopy
+
+    original = training.optimization_code_identity()
+    changed = deepcopy(original)
+    changed["source"]["src/models/algorithms/random_forest.py"] = "changed"
+    assert training.family_code_identity(original, "lightgbm") == training.family_code_identity(changed, "lightgbm")
+    assert training.family_code_identity(original, "random_forest") != training.family_code_identity(changed, "random_forest")
+    changed["source"]["src/models/cross_validation.py"] = "changed"
+    assert training.family_code_identity(original, "lightgbm") != training.family_code_identity(changed, "lightgbm")

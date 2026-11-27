@@ -169,7 +169,8 @@ def run_ablation(args) -> Path:
     output.mkdir(parents=True, exist_ok=False)
     LOG.info("Ablation execution: %s", output)
     plan_hash = training.file_sha256(args.plan)
-    config_hash = training.file_sha256(args.config)
+    config_hash = training.configuration_digest(config)
+    training.write_config_snapshot(output, config, {"evaluation": "cv_ablation", "representations": selected})
     experiment = args.experiment or config["mlflow"]["experiment"] + "-ablation-representation-safe"
     training.configure_mlflow(experiment, Path(args.mlflow_db or ROOT / paths["mlflow_db"]),
                               Path(args.mlflow_artifacts or ROOT / paths["mlflow_artifacts"]))

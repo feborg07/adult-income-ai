@@ -1,0 +1,58 @@
+# random_forest: fixed parameters, grid, and adaptive search.
+# order preserves historical grid enumeration.
+order: 10
+fixed:
+  n_estimators: 150
+  n_jobs: -1
+grid:
+  max_depth:
+  - null
+  - 15
+  min_samples_leaf:
+  - 1
+  - 5
+optuna:
+  trials: 50
+  space:
+    n_estimators:
+      type: int
+      low: 150
+      high: 500
+    max_depth:
+      type: categorical
+      choices:
+      - null
+      - 8
+      - 12
+      - 15
+      - 20
+      - 30
+    min_samples_leaf:
+      type: int
+      low: 1
+      high: 20
+    min_samples_split:
+      type: int
+      low: 2
+      high: 30
+    max_features:
+      type: categorical
+      choices:
+      - sqrt
+      - log2
+      - 0.5
+      - 1.0
+    class_weight:
+      type: categorical
+      choices:
+      - null
+      - balanced
+  enqueue:
+  - variant: robust
+    params:
+      n_estimators: 150
+      max_depth: 15
+      min_samples_leaf: 1
+      min_samples_split: 2
+      max_features: sqrt
+      class_weight: null

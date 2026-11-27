@@ -354,3 +354,27 @@ def test_cv_comparison_real_mlflow(tmp_path):
     finally:
         # Do not leak the temporary tracking URI into other integration tests.
         comparison.mlflow.set_tracking_uri(previous_uri)
+
+
+def test_cv_cohort_compares_different_configuration_hashes():
+    """Compare explicit compatible executions while excluding older incompatible runs."""
+    first = {"tags.training_execution_id": "a" * 32, "params.config_sha256": "old"}
+    second = {"tags.training_execution_id": "b" * 32, "params.config_sha256": "new", "metrics.cv_f1": 0.73}
+    unrelated = {"tags.training_execution_id": "c" * 32, "params.seed": "99"}
+    rows = pd.DataFrame([cv_run("old", **first), cv_run("new", **second), cv_run("other", **unrelated)])
+    ranked = comparison.rank_candidates(rows, evaluation="cv", execution_ids=["a" * 32, "b" * 32])
+    assert ranked.run_id.tolist() == ["new", "old"]
+    with pytest.raises(ValueError, match="Incompatible CV"):
+        comparison.rank_candidates(rows, evaluation="cv", execution_ids=["a" * 32, "c" * 32])
+    with pytest.raises(ValueError, match="No valid candidates"):
+        comparison.rank_candidates(rows, evaluation="cv", execution_ids=["a" * 32, "d" * 32])
+
+
+def test_cv_preprocessing_hash_checked_within_variant():
+    """Permit distinct variants but reject changed preprocessing within one variant."""
+    rows = pd.DataFrame([cv_run("a", **{"params.effective_preprocessing_sha256": "a"}),
+                         cv_run("b", **{"params.effective_preprocessing_sha256": "b", "tags.preprocessing_variant": "robust"})])
+    assert len(comparison.rank_candidates(rows, evaluation="cv")) == 2
+    rows.loc[1, "tags.preprocessing_variant"] = "baseline"
+    with pytest.raises(ValueError, match="effective_preprocessing_sha256"):
+        comparison.rank_candidates(rows, evaluation="cv")

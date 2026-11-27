@@ -13,6 +13,7 @@ class CatBoostAlgorithm(SklearnAlgorithm):
     """Train CatBoost on the same numeric representation as other plugins."""
 
     name = "catboost"
+    registration_order = 50
     estimator_class = CatBoostClassifier
     required_packages = ("catboost", "scikit-learn", "numpy", "scipy", "pandas")
 

@@ -9,6 +9,7 @@ class RandomForestAlgorithm(SklearnAlgorithm):
     """Bagged decision-tree ensemble."""
 
     name = "random_forest"
+    registration_order = 10
     estimator_class = RandomForestClassifier
 
     trusted_types = (

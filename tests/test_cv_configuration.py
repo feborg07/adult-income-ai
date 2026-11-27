@@ -120,7 +120,7 @@ def test_effective_settings_reach_training_and_tracking(
     run_dir = next(args.output_dir.iterdir())
     summary = json.loads((run_dir / "cv_training_summary.json").read_text())
     assert {key: summary[key] for key in expected} == expected
-    assert summary["config_sha256"] == training.file_sha256(args.config)
+    assert summary["config_sha256"] == training.configuration_digest(training.load_training_config(args.config))
     assert len(list((artifacts / "cv").glob("fold_*"))) == expected["n_splits"]
     assert not (run_dir / "best_model_pipeline.joblib").exists()
 

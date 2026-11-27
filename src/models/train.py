@@ -56,6 +56,9 @@ from dataclasses import asdict, dataclass, replace
 from itertools import product
 from pathlib import Path
 
+from .configuration import (load_resolved_config, configuration_digest,
+                            configuration_fingerprints, digest, write_config_snapshot)
+
 import joblib
 import mlflow
 import yaml
@@ -297,13 +300,12 @@ def resolve_cv_representation(config: dict) -> dict:
     raise ValueError("cv_representation must be one of: control, " + ", ".join(policies))
 
 
-def load_training_config(path: Path | None = None) -> dict:
+def load_training_config(path: Path | None = None, *, experiment_path: Path | None = None) -> dict:
     """Load and validate YAML settings before starting any training."""
     path = Path(path) if path is not None else ROOT / "configs/config.yml"
     if not path.is_file():
         raise FileNotFoundError(f"Training YAML configuration not found: {path}")
-    with path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
+    config = load_resolved_config(path, experiment_path=experiment_path)
     if not isinstance(config, dict):
         raise ValueError("Training configuration must be a YAML mapping.")
     required = {"seed", "variants", "selection_metric", "paths", "mlflow", "models"}
@@ -656,13 +658,30 @@ def optimization_code_identity() -> dict:
     # Git HEAD alone misses uncommitted implementation changes.
     source = {path.relative_to(ROOT).as_posix(): file_sha256(path) for path in files}
     versions = {}
-    for package in ("optuna", "mlflow", "scikit-learn", "numpy", "pandas", "scipy",
-                    "joblib", "lightgbm", "xgboost", "catboost"):
+    packages = {"optuna", "mlflow", "scikit-learn", "numpy", "pandas", "scipy", "joblib", "pyyaml"}
+    for family in ALGORITHM_REGISTRY.names():
+        packages.update(getattr(ALGORITHM_REGISTRY.get(family), "required_packages", ()))
+    for package in sorted(packages):
         try:
             versions[package] = version(package)
         except PackageNotFoundError:
             versions[package] = None
     return {"source": source, "python": sys.version, "dependencies": versions}
+
+
+def family_code_identity(identity: dict, family: str) -> dict:
+    """Keep shared execution code plus the selected cartridge and its dependencies."""
+    plugin_files = {f"src/models/algorithms/{name}.py" for name in ALGORITHM_REGISTRY.names() if name != family}
+    # Keep the full requirements digest in audit metadata, not in every study key.
+    packages = {"optuna", "mlflow", "scikit-learn", "numpy", "pandas", "scipy", "joblib", "pyyaml"}
+    packages.update(getattr(ALGORITHM_REGISTRY.get(family), "required_packages", ()))
+    if not isinstance(identity.get("source"), dict):
+        return identity
+    return {"source": {name: value for name, value in identity["source"].items()
+                       if name not in plugin_files and name != "requirements.txt"},
+            "python": identity["python"],
+            "dependencies": {name: value for name, value in identity["dependencies"].items()
+                             if name in packages}}
 
 
 def resolve_optuna_storage(config: dict, args) -> Path:
@@ -719,6 +738,8 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
     Optuna studies resume from persistent SQLite storage under a fixed context.
     """
     rows, winners, studies, study_rows = [], {}, {}, []
+    contexts = {}
+    scoped_fingerprints = configuration_fingerprints(config)
     # Require identical training rows across selected variants before fitting any model.
     hashes = {variant: file_sha256(processed / variant / "raw_train.csv")
               for variant in scope["variants"]}
@@ -791,6 +812,7 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
                 mlflow.set_tag("git_commit", revision)
             mlflow.log_params({
                 "variant": variant, "model": family, "config_sha256": config_sha256,
+                "algorithm_config_sha256": scoped_fingerprints["algorithm_sha256"][family],
                 "data_version": raw_hash, "preprocessing_config_sha256": config_hashes[variant],
                 "seed": config["seed"], "n_splits": n_splits,
                 "calibration_size": calibration_size, "search_strategy": scope["search"],
@@ -839,15 +861,16 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
             raise ValueError("Persistent Optuna requires a database and tracking identity.")
         study_db.parent.mkdir(parents=True, exist_ok=True)
         storage_uri = f"sqlite:///{study_db.as_posix()}"
-        context_details = {
+        full_code_identity = optimization_code_identity()
+        shared_context = {
+            "identity_schema": "cartridge_study_v2",
             "raw_training": raw_hash, "preprocessing": config_hashes,
             "effective_preprocessing": effective_hashes, "representation": identity,
             "variants": scope["variants"], "cv": cv_settings, "seed": config["seed"],
-            "code": optimization_code_identity(), "tracking": tracking_identity,
-            "config_sha256": config_sha256,
+            "tracking": tracking_identity,
             "threshold_policy": "fold_fit_inner_calibration",
         }
-        context = hashlib.sha256(json.dumps(context_details, sort_keys=True).encode("utf-8")).hexdigest()
+        fingerprints = scoped_fingerprints
 
         def evaluate_trial(trial):
             """Build the sampled estimator through its plugin and return mean CV F1."""
@@ -858,6 +881,12 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
             return EvaluationOutcome(score=row["cv_f1"], metadata=row)
 
         for family in scope["models"]:
+            # Scope the persistent study to this model, not unrelated cartridges or budgets.
+            context_details = {**shared_context, "family": family,
+                "code": family_code_identity(full_code_identity, family),
+                "study_configuration_sha256": fingerprints["study_configuration_sha256"][family]}
+            context = digest(context_details)
+            contexts[family] = {"id": context, "details": context_details}
             sampler = optuna.samplers.TPESampler(
                 seed=config["seed"], n_startup_trials=config["optuna"]["n_startup_trials"],
             )
@@ -906,8 +935,12 @@ def run_cv_search(config: dict, scope: dict, processed: Path, output: Path,
     if studies:
         # The Optuna best trial uses F1 alone; our leaderboard retains metric tie-breakers.
         summary["optuna_studies"] = studies
-        summary["optuna_context_id"] = context
-        summary["optuna_context"] = context_details
+        summary["optuna_contexts"] = contexts
+        summary["optimization_code_identity"] = full_code_identity
+        # Preserve the historical single-family summary API without mislabeling multi-family runs.
+        if len(contexts) == 1:
+            summary["optuna_context_id"] = context
+            summary["optuna_context"] = context_details
         summary["optuna_storage"] = str(study_db)
         summary["optuna_cumulative_successful_candidates"] = len(study_rows)
         summary["optuna_best_ranked_candidate"] = max(study_rows, key=cv_rank)
@@ -933,8 +966,9 @@ def train(args):
     """
 
     evaluation = resolve_evaluation(args)
-    config = load_training_config(getattr(args, "config", None))
-    config, search = resolve_training_scope(config, args)
+    resolved = load_training_config(getattr(args, "config", None),
+                                    experiment_path=getattr(args, "experiment_config", None))
+    config, search = resolve_training_scope(resolved, args)
     # Resolve effective settings before creating any output or tracking artifacts.
     config["cross_validation"] = resolve_cv_settings(config, args)
     active_variants = config["variants"]
@@ -970,7 +1004,13 @@ def train(args):
     artifacts = args.mlflow_artifacts.resolve()
 
     # Record configuration and initialize tracking for either evaluation protocol.
-    config_sha256 = file_sha256(Path(getattr(args, "config", None) or ROOT / "configs/config.yml"))
+    # Preserve all resolved values and the actual invocation scope for reproducibility.
+    config_sha256 = configuration_digest(resolved)
+    write_config_snapshot(output, resolved, {**scope, "evaluation": evaluation,
+        "mode": "validation" if args.quick else "full", "cross_validation": config["cross_validation"],
+        "tracking": {"db": str(db), "artifacts": str(artifacts), "experiment": args.experiment},
+        "processed_dir": str(processed), "preprocessor_dir": str(preprocessor_dir),
+        "optuna_storage": str(study_db) if study_db else None})
     configure_mlflow(args.experiment, db, artifacts)
     if evaluation == "cv":
         run_cv_search(config, scope, processed, output, execution_id, config_sha256,
@@ -1568,6 +1608,8 @@ def parse_args():
     parser.add_argument("--mlflow-db", type=Path, default=None)
     parser.add_argument("--mlflow-artifacts", type=Path, default=None)
     parser.add_argument("--experiment", default=None)
+    parser.add_argument("--experiment-config", type=Path, default=None,
+                        help="Optional YAML experiment overrides (not the MLflow experiment name).")
     lifecycle = parser.add_mutually_exclusive_group()
     lifecycle.add_argument(
         "--mode", choices=("validation", "full"), default=None,
@@ -1615,7 +1657,7 @@ def parse_args():
     args.mode = args.mode or ("validation" if args.quick else "full")
     args.quick = args.mode == "validation"
     try:
-        config = load_training_config(args.config)
+        config = load_training_config(args.config, experiment_path=args.experiment_config)
         resolve_training_scope(config, args)
         resolve_evaluation(args)
         resolve_cv_settings(config, args)

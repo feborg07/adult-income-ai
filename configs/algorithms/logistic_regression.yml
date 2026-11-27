@@ -1,0 +1,33 @@
+# logistic_regression: fixed parameters, grid, and adaptive search.
+# order preserves historical grid enumeration.
+order: 0
+fixed:
+  max_iter: 5000
+  solver: lbfgs
+  tol: 0.0001
+grid:
+  C:
+  - 0.1
+  - 1.0
+  - 10.0
+  class_weight:
+  - null
+  - balanced
+optuna:
+  trials: 50
+  space:
+    C:
+      type: float
+      low: 0.0001
+      high: 100.0
+      log: true
+    class_weight:
+      type: categorical
+      choices:
+      - null
+      - balanced
+  enqueue:
+  - variant: interactions
+    params:
+      C: 10.0
+      class_weight: null

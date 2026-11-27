@@ -1,0 +1,59 @@
+# catboost: fixed parameters, grid, and adaptive search.
+# order preserves historical grid enumeration.
+order: 50
+fixed:
+  loss_function: Logloss
+  task_type: CPU
+  thread_count: 4
+  verbose: false
+  allow_writing_files: false
+  l2_leaf_reg: 3.0
+grid:
+  iterations:
+  - 200
+  - 500
+  depth:
+  - 4
+  - 6
+  learning_rate:
+  - 0.03
+  - 0.1
+optuna:
+  trials: 100
+  space:
+    iterations:
+      type: int
+      low: 200
+      high: 1500
+    learning_rate:
+      type: float
+      low: 0.005
+      high: 0.2
+      log: true
+    depth:
+      type: int
+      low: 3
+      high: 8
+    l2_leaf_reg:
+      type: float
+      low: 0.1
+      high: 30.0
+      log: true
+    random_strength:
+      type: float
+      low: 0.0
+      high: 5.0
+    auto_class_weights:
+      type: categorical
+      choices:
+      - null
+      - Balanced
+  enqueue:
+  - variant: baseline
+    params:
+      iterations: 500
+      learning_rate: 0.1
+      depth: 4
+      l2_leaf_reg: 3.0
+      random_strength: 1.0
+      auto_class_weights: null

@@ -9,6 +9,7 @@ class HistGradientBoostingAlgorithm(SklearnAlgorithm):
     """Histogram-based gradient-boosted classifier."""
 
     name = "hist_gradient_boosting"
+    registration_order = 20
     estimator_class = HistGradientBoostingClassifier
 
     trusted_types = (

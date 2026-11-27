@@ -1,0 +1,6 @@
+# Optional experiment profile; retains the original search space and warm starts.
+# This changes the cumulative budget, not the model parameters or data protocol.
+models:
+  xgboost:
+    optuna:
+      trials: 150

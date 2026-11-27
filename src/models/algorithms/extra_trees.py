@@ -9,6 +9,7 @@ class ExtraTreesAlgorithm(SklearnAlgorithm):
     """Extremely randomized tree ensemble."""
 
     name = "extra_trees"
+    registration_order = 30
     estimator_class = ExtraTreesClassifier
 
     trusted_types = (

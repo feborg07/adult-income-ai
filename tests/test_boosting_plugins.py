@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
+from src.models.configuration import load_resolved_config
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.base import clone
@@ -36,7 +37,7 @@ FAMILIES = {
 def config():
     """Read the production YAML without changing it."""
     path = Path(__file__).resolve().parents[1] / "configs/config.yml"
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    return load_resolved_config(path)
 
 
 @pytest.fixture(scope="module")

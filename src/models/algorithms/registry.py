@@ -1,13 +1,8 @@
-"""Explicit registration and lookup of algorithm plugins."""
+"""Controlled discovery and lookup of algorithm plugins."""
 
 from .base import BaseAlgorithm
-from .logistic_regression import LogisticRegressionAlgorithm
-from .random_forest import RandomForestAlgorithm
-from .extra_trees import ExtraTreesAlgorithm
-from .hist_gradient_boosting import HistGradientBoostingAlgorithm
-from .xgboost import XGBoostAlgorithm
-from .catboost import CatBoostAlgorithm
-from .lightgbm import LightGBMAlgorithm
+from .discovery import discover_plugins
+from src.models import algorithms as algorithm_package
 
 
 class AlgorithmRegistry:
@@ -58,16 +53,7 @@ class AlgorithmRegistry:
         return tuple(self._plugins)
 
 
-# Keep existing family order and append new production plugins.
+# Discover trusted local modules; do not import arbitrary YAML-specified paths.
 ALGORITHM_REGISTRY = AlgorithmRegistry()
-
-for plugin in (
-    LogisticRegressionAlgorithm(),
-    RandomForestAlgorithm(),
-    HistGradientBoostingAlgorithm(),
-    ExtraTreesAlgorithm(),
-    XGBoostAlgorithm(),
-    CatBoostAlgorithm(),
-    LightGBMAlgorithm(),
-):
+for plugin in discover_plugins(algorithm_package):
     ALGORITHM_REGISTRY.register(plugin)

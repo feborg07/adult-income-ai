@@ -1,0 +1,80 @@
+# lightgbm: fixed parameters, grid, and adaptive search.
+# order preserves historical grid enumeration.
+order: 60
+fixed:
+  objective: binary
+  boosting_type: gbdt
+  device_type: cpu
+  n_jobs: 4
+  verbosity: -1
+  deterministic: true
+  force_col_wise: true
+  min_child_samples: 20
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+grid:
+  n_estimators:
+  - 200
+  - 500
+  num_leaves:
+  - 15
+  - 31
+  learning_rate:
+  - 0.03
+  - 0.1
+optuna:
+  trials: 100
+  space:
+    n_estimators:
+      type: int
+      low: 200
+      high: 1500
+    learning_rate:
+      type: float
+      low: 0.005
+      high: 0.2
+      log: true
+    num_leaves:
+      type: int
+      low: 8
+      high: 63
+    min_child_samples:
+      type: int
+      low: 10
+      high: 100
+    subsample:
+      type: float
+      low: 0.6
+      high: 1.0
+    colsample_bytree:
+      type: float
+      low: 0.6
+      high: 1.0
+    reg_alpha:
+      type: float
+      low: 0.0
+      high: 5.0
+    reg_lambda:
+      type: float
+      low: 0.01
+      high: 30.0
+      log: true
+    class_weight:
+      type: categorical
+      choices:
+      - null
+      - balanced
+  enqueue:
+  - variant: interactions
+    params:
+      n_estimators: 500
+      learning_rate: 0.03
+      num_leaves: 15
+      min_child_samples: 20
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_alpha: 0.0
+      reg_lambda: 1.0
+      class_weight: null

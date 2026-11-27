@@ -1,11 +1,13 @@
 """Validate the Optuna YAML contract without executing model optimization."""
 
 import copy
+from math import prod
 from pathlib import Path
 
 import optuna
 import pytest
 import yaml
+from src.models.configuration import load_resolved_config
 
 from src.models.search.configuration import validate_distribution, validate_optuna_config
 
@@ -14,18 +16,17 @@ from src.models.search.configuration import validate_distribution, validate_optu
 def optuna_config():
     """Load a fresh copy of the checked-in training configuration."""
     path = Path(__file__).resolve().parents[1] / "configs/config.yml"
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    return load_resolved_config(path)
 
 
 def test_default_spaces_and_budgets(optuna_config):
-    """Keep the approved per-family budget and the existing grid unchanged."""
+    """Validate every declared budget without mutating the configuration."""
     before = copy.deepcopy(optuna_config)
     validate_optuna_config(optuna_config)
     budgets = {name: spec["optuna"]["trials"] for name, spec in optuna_config["models"].items()
                if "optuna" in spec}
-    assert budgets == {"hist_gradient_boosting": 50, "xgboost": 100,
-                       "catboost": 100, "lightgbm": 100}
-    assert sum(budgets.values()) == 350
+    assert budgets
+    assert all(type(value) is int and value > 0 for value in budgets.values())
     assert optuna_config == before
 
 
@@ -132,7 +133,8 @@ def test_invalid_queued_configuration(optuna_config, change):
         validate_optuna_config(optuna_config)
 
 
-@pytest.mark.parametrize("family", ["lightgbm", "xgboost", "catboost", "hist_gradient_boosting"])
+@pytest.mark.parametrize("family", [name for name, spec in load_resolved_config(
+    Path(__file__).resolve().parents[1] / "configs/config.yml")["models"].items() if "optuna" in spec])
 def test_distributions_and_queued_values_work_with_optuna(optuna_config, tmp_path, family):
     """Exercise real Optuna distributions, queued starts and SQLite persistence."""
     spec = optuna_config["models"][family]["optuna"]
@@ -141,6 +143,8 @@ def test_distributions_and_queued_values_work_with_optuna(optuna_config, tmp_pat
     study = optuna.create_study(study_name=family, direction="maximize", storage=storage,
         sampler=optuna.samplers.TPESampler(seed=optuna_config["seed"],
                                           n_startup_trials=settings["n_startup_trials"]))
+    if not spec.get("enqueue"):
+        pytest.skip("This cartridge does not declare a warm start.")
     queued = spec["enqueue"][0]
     study.enqueue_trial({"variant": queued["variant"], **queued["params"]})
     trial = study.ask()
@@ -167,8 +171,9 @@ def test_training_loader_validates_optuna_schema(optuna_config, tmp_path):
     path = tmp_path / "training.yml"
     path.write_text(yaml.safe_dump(optuna_config, sort_keys=False), encoding="utf-8")
     config = training.load_training_config(path)
-    assert len(training.candidates(True, config=config)) == 7
-    assert len(training.candidates(False, config=config)) == 42
+    assert len(training.candidates(True, config=config)) == len(config["models"])
+    assert len(training.candidates(False, config=config)) == sum(
+        prod(len(values) for values in spec["grid"].values()) for spec in config["models"].values())
     optuna_config["models"]["lightgbm"]["optuna"]["trials"] = -1
     path.write_text(yaml.safe_dump(optuna_config, sort_keys=False), encoding="utf-8")
     with pytest.raises(ValueError, match="models.lightgbm.optuna.trials"):

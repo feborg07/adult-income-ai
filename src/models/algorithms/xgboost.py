@@ -10,6 +10,7 @@ class XGBoostAlgorithm(SklearnAlgorithm):
     """Build XGBoost classifiers and log them in native UBJSON format."""
 
     name = "xgboost"
+    registration_order = 40
     estimator_class = XGBClassifier
     required_packages = ("xgboost", "scikit-learn", "numpy", "scipy", "pandas")
 
