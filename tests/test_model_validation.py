@@ -3,7 +3,7 @@
 These tests deliberately do not invoke the 12-/54-candidate training sweep.
 They validate the scikit-learn prediction contract and a minimal F1 score on
 an independent, seeded hold-out sample. The CI training job separately gates
-real Adult Income validation F1 through MLflow.
+real Adult Income mean CV F1 from the current training execution.
 """
 
 import numpy as np

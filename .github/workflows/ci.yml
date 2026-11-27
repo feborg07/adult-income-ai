@@ -52,13 +52,13 @@ jobs:
   # JOB 2 — TRAINING AND PERFORMANCE VALIDATION
   # ============================================================
   train:
-    name: Train and Validate Model
+    name: CV Training Smoke Check
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     env:
-      MIN_VALIDATION_F1: "0.65"
+      MIN_CV_F1: "0.65"
 
     steps:
       # 1. Retrieve repository source code.
@@ -89,71 +89,25 @@ jobs:
         run: |
           python -m scripts.run_preprocessing
 
-      # 6. Train candidates using the quick configuration.
-      # This does not promote or replace the reference model.
-      - name: Train candidate models
+      # 6. Train the first configuration of each configured family and variant.
+      # Gate the fresh training-only CV execution; do not access test labels,
+      # select a production model, or use historical MLflow scores.
+      - name: Train and check CV candidates
         run: |
-          python -m src.models.train --quick
+          python -m scripts.check_ci_training --min-f1 "$MIN_CV_F1"
 
-      # 7. Verify model performance from MLflow metrics.
-      # Exit with status 1 if no valid candidate reaches
-      # the required validation F1 score.
-      - name: Validate minimum model performance
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os
-          import sys
-
-          import mlflow
-          import pandas as pd
-
-          threshold = float(os.environ["MIN_VALIDATION_F1"])
-
-          runs = mlflow.search_runs(
-              search_all_experiments=True,
-              output_format="pandas",
-          )
-
-          metric_column = "metrics.val_f1"
-
-          if runs.empty or metric_column not in runs.columns:
-              print("ERROR: No MLflow validation F1 metrics found.")
-              sys.exit(1)
-
-          scores = pd.to_numeric(
-              runs[metric_column],
-              errors="coerce",
-          ).dropna()
-
-          if scores.empty:
-              print("ERROR: No valid validation F1 scores found.")
-              sys.exit(1)
-
-          best_f1 = float(scores.max())
-
-          print(f"Best validation F1: {best_f1:.4f}")
-          print(f"Minimum required F1: {threshold:.4f}")
-
-          if best_f1 < threshold:
-              print("FAILED: Model performance below threshold.")
-              sys.exit(1)
-
-          print("PASSED: Model meets minimum performance threshold.")
-          PY
-
-      # 8. Publish execution summary.
+      # 7. Publish execution summary.
       - name: Write training summary
         if: always()
         run: |
           echo "## Sprint 17 — CI Training" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Training mode: quick" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Minimum validation F1: $MIN_VALIDATION_F1" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Training mode: validation-only CV (first configuration)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Minimum mean CV F1: $MIN_CV_F1" >> "$GITHUB_STEP_SUMMARY"
           echo "- Training job status: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Reference model promotion: disabled" >> "$GITHUB_STEP_SUMMARY"
 
-      # 9. Preserve training artifacts for inspection.
+      # 8. Preserve training artifacts for inspection.
       - name: Upload training artifacts
         if: always()
         uses: actions/upload-artifact@v4
