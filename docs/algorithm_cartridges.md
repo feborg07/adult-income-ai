@@ -71,6 +71,25 @@ python -m pytest tests/ -q
 ```
 
 Do not reset MLflow, Optuna, datasets or the reference model. This refactor is
-not a model promotion. Complete local regression verification before launching
-the remaining 150 trials. Training lifecycle terminology cleanup remains a
-separate end-of-Phase-3 task.
+not a model promotion. The planned 500-trial optimization campaign is complete.
+
+## Training lifecycle terminology
+
+`--mode validation` permits validation-only training without test evaluation
+or promotion. Search depth is independent: `--search first`, `grid` or
+`optuna` (CV only). A 100-trial Optuna execution is not a quick smoke check.
+The final validation-only CLI message is `Validation Training Successful`;
+individual trial outcomes remain available in the study summary. Full-mode
+messages are unchanged.
+
+`--quick` remains a backward-compatible alias for `--mode validation`.
+The internal `quick` flag, historical MLflow `mode=quick` tags and
+`quick_training_summary.json` filename remain unchanged for compatibility
+with existing reports, comparison tools, CI and promotion guards. CI uses
+first-candidate validation as a smoke check. Do not invoke the legacy full
+mode for Phase 3; it accesses held-out test data.
+
+The study identity includes the training source hash. Even this terminology
+cleanup changes that hash, so a later Optuna invocation can create a new
+study rather than resume the completed one. Existing experimental artifacts
+remain valid for comparison and must be preserved.

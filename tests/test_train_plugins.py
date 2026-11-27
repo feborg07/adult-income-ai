@@ -125,7 +125,7 @@ def test_quick_training_dispatches_all_registered_plugins(
 
 
 @pytest.mark.parametrize("quick, expected", [
-    (True, "Quick Training Successful"),
+    (True, "Validation Training Successful"),
     (False, "Full Training Completed"),
 ])
 def test_cli_reports_training_completion(monkeypatch, caplog, quick, expected):
@@ -140,10 +140,11 @@ def test_cli_reports_training_completion(monkeypatch, caplog, quick, expected):
 
     runner.assert_called_once_with(args)
     assert expected in caplog.messages
+    assert "Quick Training Successful" not in caplog.messages
     assert not any("Training Failed" in message for message in caplog.messages)
 
 
-@pytest.mark.parametrize("quick, mode", [(True, "Quick"), (False, "Full")])
+@pytest.mark.parametrize("quick, mode", [(True, "Validation"), (False, "Full")])
 def test_cli_reports_training_failure(monkeypatch, caplog, quick, mode):
     """Report failure and propagate the exception so the CLI exits nonzero."""
     args = Namespace(quick=quick, show_mlflow_command=False)
@@ -159,8 +160,37 @@ def test_cli_reports_training_failure(monkeypatch, caplog, quick, mode):
     assert caught.value is error
     runner.assert_called_once_with(args)
     assert f"{mode} Training Failed: intentional training failure" in caplog.messages
-    assert "Quick Training Successful" not in caplog.messages
+    assert "Validation Training Successful" not in caplog.messages
     assert "Full Training Completed" not in caplog.messages
+
+
+@pytest.mark.parametrize("options", [
+    ["--quick"],
+    ["--mode", "validation", "--search", "first"],
+    ["--mode", "validation", "--search", "grid"],
+    ["--mode", "validation", "--evaluation", "cv", "--search", "optuna",
+     "--models", "xgboost", "--trials", "100"],
+])
+def test_validation_status_independent_of_search(monkeypatch, caplog, options):
+    """Exercise real CLI parsing and verify lifecycle wording for all searches."""
+    monkeypatch.setattr("sys.argv", ["train", *options])
+    runner = Mock()
+    monkeypatch.setattr(training, "train", runner)
+
+    # The real parser preserves mode and search options; no models are fitted.
+    with caplog.at_level(logging.INFO, logger="training"):
+        training.main()
+
+    runner.assert_called_once()
+    args = runner.call_args.args[0]
+    assert args.mode == "validation"
+    assert args.quick is True
+    if "--search" in options:
+        assert args.search == options[options.index("--search") + 1]
+    if "--trials" in options:
+        assert args.trials == 100
+    assert "Validation Training Successful" in caplog.messages
+    assert "Quick Training Successful" not in caplog.messages
 
 
 def test_cli_show_mlflow_command_does_not_report_training(

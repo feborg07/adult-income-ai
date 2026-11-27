@@ -30,7 +30,7 @@ The script:
     - CV mode fits independent preprocessors from saved raw training rows.
     - Fits candidate models using training data only.
     - Selects models and thresholds using validation data.
-    - Evaluates winners using held-out test data.
+    - Evaluates winners using held-out test data only in full mode.
     - Tracks experiments using MLflow.
     - Preserves feature names in deployable pipelines.
     - Saves each training execution to a unique models/runs/<run_id>/ directory.
@@ -987,7 +987,7 @@ def train(args):
         }
     processed = args.processed_dir.resolve()
     preprocessor_dir = args.preprocessor_dir.resolve()
-    # Each invocation owns a unique directory, including quick runs.
+    # Each invocation owns a unique directory, including validation-only runs.
     # Never reuse an existing directory or write into the DVC reference tree.
     output_root = args.output_dir.resolve()
     reference_dir = (ROOT / "models/reference").resolve()
@@ -1261,13 +1261,13 @@ def train(args):
             data,
         )
 
-    # Quick mode is a smoke check. Any failed candidate means the check fails,
-    # even if another candidate in the same preprocessing variant succeeded.
+    # Holdout validation requires every candidate to succeed, even if another
+    # candidate in the same preprocessing variant succeeded.
     if args.quick:
         failures = [row for row in leaderboard if row["status"] != "FINISHED"]
         if failures:
             raise RuntimeError(
-                f"Quick smoke check failed: {len(failures)} candidate(s) failed; "
+                f"Validation training failed: {len(failures)} candidate(s) failed; "
                 f"first failure: {failures[0]['variant']}/{failures[0]['model']}: "
                 f"{failures[0].get('error', 'unknown error')}"
             )
@@ -1335,13 +1335,12 @@ def train(args):
         data,
     ) in winners.items():
 
-        # Quick mode is a smoke check only: training, validation and MLflow
-        # logging have already succeeded. Do not package a deployable
-        # pipeline or evaluate the held-out test partition.
+        # Validation-only mode has completed training and MLflow logging.
+        # Do not package a deployable pipeline or evaluate the held-out test partition.
         if args.quick:
             summary["winners"][variant] = {"validation": best}
             LOG.info(
-                "Quick check %s: %s, validation F1=%.4f",
+                "Validation winner %s: %s, F1=%.4f",
                 variant, best["model"], best["val_f1"],
             )
             continue
@@ -1629,7 +1628,7 @@ def parse_args():
     )
     parser.add_argument(
         "--search", choices=("first", "grid", "optuna"), default=None,
-        help="Search depth (default: first in quick mode, grid in full mode).",
+        help="Search strategy (default: first in validation mode, grid in full mode).",
     )
     parser.add_argument(
         "--trials", type=int, default=None,
@@ -1702,7 +1701,7 @@ def main():
         return
 
     # Report the final execution status without hiding training errors.
-    mode = "Quick" if args.quick else "Full"
+    mode = "Validation" if args.quick else "Full"
     try:
         train(args)
     except Exception as exc:
@@ -1710,7 +1709,8 @@ def main():
         raise  # Preserve the original traceback and nonzero CLI exit status.
 
     if args.quick:
-        LOG.info("Quick Training Successful")
+        # Success describes the execution, not the outcome of each Optuna trial.
+        LOG.info("Validation Training Successful")
     else:
         # Full mode may complete with individual candidate failures.
         LOG.info("Full Training Completed")

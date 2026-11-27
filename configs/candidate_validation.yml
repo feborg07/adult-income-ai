@@ -1,0 +1,94 @@
+seed: 42
+calibration_size: 0.2
+representation: no_fnlwgt
+raw_training_sha256: ede5502a8683dccb507fdc82a8ec13b88bcfdc10849659c96695f466c66f1b01
+fold_sha256: 330c4af9f51e08887a74986875e3e2b900981e5e3544f6d69d7d4f47b8958201
+candidates:
+  lightgbm:
+    family: lightgbm
+    variant: robust
+    source_run_id: d44eb8df207b4175a6c52b5346007968
+    cv_f1: 0.730412059192477
+    effective_preprocessing_sha256: 478f4df77e34a4b0437727fc7c86e66ce4a1ea13b38857fc4aa01a4dc095a2f8
+    parameters:
+      boosting_type: gbdt
+      class_weight: balanced
+      colsample_bytree: 0.6869022176682228
+      deterministic: true
+      device_type: cpu
+      force_col_wise: true
+      learning_rate: 0.021998124128669177
+      min_child_samples: 10
+      n_estimators: 513
+      n_jobs: 4
+      num_leaves: 46
+      objective: binary
+      reg_alpha: 1.1510710051484352
+      reg_lambda: 2.286201684464696
+      subsample: 0.8411512399436067
+      subsample_freq: 1
+      verbosity: -1
+  xgboost:
+    family: xgboost
+    variant: baseline
+    source_run_id: bf0714e173b84d19a4826583aceae85d
+    cv_f1: 0.7304049505256512
+    effective_preprocessing_sha256: 1843742923089f1bba46d8ec3432cb302333818dcf64d4004b1d72e028b7d428
+    parameters:
+      colsample_bytree: 0.8
+      device: cpu
+      eval_metric: logloss
+      gamma: 0.0
+      learning_rate: 0.03
+      max_depth: 6
+      min_child_weight: 1.0
+      n_estimators: 500
+      n_jobs: 4
+      objective: binary:logistic
+      reg_alpha: 0.0
+      reg_lambda: 1.0
+      scale_pos_weight: 1.0
+      subsample: 0.8
+      tree_method: hist
+      verbosity: 0
+  catboost:
+    family: catboost
+    variant: baseline
+    source_run_id: fcaf8407b4e14ff49d86c6acf20def9d
+    cv_f1: 0.7286750570791565
+    effective_preprocessing_sha256: 1843742923089f1bba46d8ec3432cb302333818dcf64d4004b1d72e028b7d428
+    parameters:
+      allow_writing_files: false
+      auto_class_weights: null
+      depth: 3
+      iterations: 852
+      l2_leaf_reg: 3.8941113939282244
+      learning_rate: 0.14028223418495586
+      loss_function: Logloss
+      random_strength: 2.661064039453538
+      task_type: CPU
+      thread_count: 4
+      verbose: false
+  hgb_optuna:
+    family: hist_gradient_boosting
+    variant: baseline
+    source_run_id: 36074aa805e9489c9ae8336bfb7cd8b0
+    cv_f1: 0.7276524236023669
+    effective_preprocessing_sha256: 1843742923089f1bba46d8ec3432cb302333818dcf64d4004b1d72e028b7d428
+    parameters:
+      class_weight: null
+      l2_regularization: 7.915826638346856
+      learning_rate: 0.13484367567643119
+      max_iter: 485
+      max_leaf_nodes: 12
+      min_samples_leaf: 24
+  hgb_grid:
+    family: hist_gradient_boosting
+    variant: baseline
+    source_run_id: f029df42b3d94729b3684cdfdf0c3fa6
+    cv_f1: 0.7276391219134228
+    effective_preprocessing_sha256: 1843742923089f1bba46d8ec3432cb302333818dcf64d4004b1d72e028b7d428
+    parameters:
+      max_iter: 150
+      learning_rate: 0.1
+      max_leaf_nodes: 15

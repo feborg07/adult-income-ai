@@ -837,14 +837,18 @@ def test_quick_training_leaderboard(
 def test_quick_training_rejects_partial_candidate_failures(
     training_workspace, isolated_mlflow, monkeypatch
 ):
-    """The smoke check must fail if even one model configuration breaks."""
+    """Holdout validation must fail if even one model configuration breaks."""
     from sklearn.base import BaseEstimator, ClassifierMixin
 
     class BrokenClassifier(BaseEstimator, ClassifierMixin):
+        """Estimator that fails deliberately during fitting."""
+
         def fit(self, X, y):
-            raise RuntimeError("intentional quick failure")
+            """Raise the expected training error."""
+            raise RuntimeError("intentional validation failure")
 
     def with_failure(quick=False, config=None):
+        """Return one failing and one valid candidate."""
         # Use a YAML-defined family so the test reaches the candidate fit
         # failure handler rather than failing during MLflow parameter logging.
         return [
@@ -853,7 +857,7 @@ def test_quick_training_rejects_partial_candidate_failures(
         ]
 
     monkeypatch.setattr(training, "candidates", with_failure)
-    with pytest.raises(RuntimeError, match="Quick smoke check failed"):
+    with pytest.raises(RuntimeError, match="Validation training failed"):
         run_training(training_workspace)
 
 
