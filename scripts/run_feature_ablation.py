@@ -61,12 +61,6 @@ def load_plan(path: Path) -> dict:
     return plan
 
 
-def common_grouping_exclusions(plan: dict) -> tuple[str, ...]:
-    """Use every planned exclusion, not only the currently selected representations."""
-    excluded = {feature for features in plan["representations"].values() for feature in features}
-    return PreprocessingConfig(excluded_features=list(excluded)).excluded_features
-
-
 def audit_overlap(X: pd.DataFrame, indices, excluded: tuple[str, ...]) -> list[dict]:
     """Count exact retained-raw-vector overlap between each pair of fold subsets.
 
@@ -142,7 +136,7 @@ def run_ablation(args) -> Path:
     raw_hash = next(iter(raw_hashes.values()))
     X, y = load_untransformed_partition(processed / sorted(variants)[0], "train")
     settings = {**config["cross_validation"], "random_state": config["seed"]}
-    grouping_exclusions = common_grouping_exclusions(plan)
+    grouping_exclusions = cv.COMMON_GROUPING_EXCLUSIONS
     settings["grouping_excluded_features"] = grouping_exclusions
     indices = create_cv_folds(X, y, **settings)
     # Fail before tracking or fitting if the common basis is not isolated.
@@ -187,7 +181,7 @@ def run_ablation(args) -> Path:
             with training.mlflow.start_run(run_name=f"ablation-{name}-{representation}") as run:
                 training.mlflow.set_tags({"evaluation_protocol": "cv_ablation", "mode": "quick",
                                           "training_execution_id": execution_id, "candidate": name,
-                                          "grouping_policy": "common_retained_raw_predictors_v1",
+                                          "grouping_policy": cv.COMMON_GROUPING_POLICY,
                                           "representation": representation, "model_family": spec["family"],
                                           "preprocessing_variant": variant})
                 training.mlflow.log_params({"data_version": raw_hash, "fold_sha256": fold_hash,
@@ -208,7 +202,7 @@ def run_ablation(args) -> Path:
                 run_id = run.info.run_id
             rows.append({"candidate": name, "family": spec["family"], "variant": variant,
                          "representation": representation, "excluded_features": json.dumps(excluded),
-                         "fold_sha256": fold_hash, "grouping_policy": "common_retained_raw_predictors_v1",
+                         "fold_sha256": fold_hash, "grouping_policy": cv.COMMON_GROUPING_POLICY,
                          "parameters": json.dumps(spec["parameters"], sort_keys=True), "run_id": run_id,
                          **metrics, "convergence_warning_count": warning_count})
             fold_rows.extend({"candidate": name, "representation": representation, "run_id": run_id,
@@ -222,7 +216,7 @@ def run_ablation(args) -> Path:
     summary = {"execution_id": execution_id, "evaluation_protocol": "cv_ablation",
                "data_source": "raw_training_partition", "raw_training_sha256": raw_hash,
                "fold_sha256": fold_hash, "settings": settings, "git_commit": training.git_revision(),
-               "grouping_policy": "common_retained_raw_predictors_v1",
+               "grouping_policy": cv.COMMON_GROUPING_POLICY,
                "grouping_features": [name for name in FEATURE_COLUMNS if name not in grouping_exclusions],
                "common_group_count": len(np.unique(predictor_group_ids(X.drop(columns=list(grouping_exclusions))))),
                "common_group_overlap": common_audit, "fold_balance": fold_balance,

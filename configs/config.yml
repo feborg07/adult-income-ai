@@ -7,6 +7,8 @@ variants:
 - robust
 - interactions
 selection_metric: val_f1
+# All CV representations share grouping exclusions [fnlwgt, race, sex].
+# This setting changes model inputs only, not CV row assignments.
 cv_representation: no_fnlwgt
 cross_validation:
   n_splits: 3

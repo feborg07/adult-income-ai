@@ -10,7 +10,7 @@ from src.data.preprocess import (
     ABLATION_FEATURES, PreprocessingConfig, create_cv_folds,
     encode_target, predictor_group_ids, split_features_target,
 )
-from src.models.cross_validation import prepare_cv_folds
+from src.models.cross_validation import prepare_cv_folds, resolve_cv_representation
 
 
 @pytest.fixture
@@ -88,3 +88,41 @@ def test_preprocessing_grouping_independence(grouped_data, excluded):
             assert actual.index.equals(X.iloc[part].index)
         engineer = fold.preprocessor.named_steps["feature_engineering"]
         assert set(engineer.required_features_) == set(X.columns) - set(excluded)
+
+
+@pytest.mark.parametrize("name,excluded", [
+    ("control", ()),
+    ("no_fnlwgt", ("fnlwgt",)),
+    ("no_fnlwgt_race", ("fnlwgt", "race")),
+    ("no_fnlwgt_sex", ("fnlwgt", "sex")),
+    ("no_fnlwgt_demographics", ("fnlwgt", "race", "sex")),
+])
+def test_universal_grouping_preserves_model_inputs(grouped_data, name, excluded):
+    """Match the historical reduced-basis partitions for every representation."""
+    X, y = grouped_data
+    policy = resolve_cv_representation({"cv_representation": name})
+    assert policy["excluded_features"] == excluded
+    assert policy["grouping_policy"] == "common_retained_raw_predictors_v1"
+    assert policy["grouping_excluded_features"] == ABLATION_FEATURES
+    expected = create_cv_folds(X, y, grouping_excluded_features=ABLATION_FEATURES)
+    folds = prepare_cv_folds(
+        X, y, PreprocessingConfig(excluded_features=excluded),
+        grouping_excluded_features=policy["grouping_excluded_features"],
+    )
+    for fold, parts in zip(folds, expected):
+        for actual, part in zip((fold.X_fit, fold.X_calibration, fold.X_scoring), parts):
+            np.testing.assert_array_equal(actual.index, X.iloc[part].index)
+        engineer = fold.preprocessor.named_steps["feature_engineering"]
+        assert set(engineer.required_features_) == set(X.columns) - set(excluded)
+
+
+def test_omitted_representation_uses_common_grouping():
+    """Keep full model inputs for legacy YAML while applying the shared policy."""
+    assert resolve_cv_representation({}) == resolve_cv_representation({"cv_representation": "control"})
+
+
+@pytest.mark.parametrize("name", [None, [], {}, "unknown"])
+def test_universal_grouping_rejects_invalid_representation(name):
+    """Reject malformed or unknown model input policies."""
+    with pytest.raises(ValueError, match="cv_representation"):
+        resolve_cv_representation({"cv_representation": name})

@@ -74,6 +74,7 @@ from .algorithms.base import BINARY_CLASSIFICATION
 from .algorithms.registry import ALGORITHM_REGISTRY
 from .tasks import binary_classification as binary_task
 from . import cross_validation as cv
+from .cross_validation import resolve_cv_representation
 from .search.configuration import validate_optuna_config
 from src.data.preprocess import (
     PreprocessingConfig, create_cv_folds, load_untransformed_partition,
@@ -274,30 +275,6 @@ def resolve_cv_settings(config: dict, args=None) -> dict:
     settings.update(overrides)
     validate(settings)
     return settings
-
-
-def resolve_cv_representation(config: dict) -> dict:
-    """Resolve the CV-only input policy without changing saved holdout artifacts.
-
-    Old YAML files without a policy retain the original full-input protocol.
-    The selected policy reproduces the common grouping basis of the ablation.
-    """
-    name = config.get("cv_representation", "control")
-    if name == "control":
-        return {"representation": name, "excluded_features": (),
-                "grouping_excluded_features": (), "grouping_policy": "full_raw_predictors_v1"}
-    # Keep the same conservative grouping basis across reduced representations.
-    policies = {
-        "no_fnlwgt": ("fnlwgt",),
-        "no_fnlwgt_race": ("fnlwgt", "race"),
-        "no_fnlwgt_sex": ("fnlwgt", "sex"),
-        "no_fnlwgt_demographics": ("fnlwgt", "race", "sex"),
-    }
-    if isinstance(name, str) and name in policies:
-        return {"representation": name, "excluded_features": policies[name],
-                "grouping_excluded_features": ("fnlwgt", "race", "sex"),
-                "grouping_policy": "common_retained_raw_predictors_v1"}
-    raise ValueError("cv_representation must be one of: control, " + ", ".join(policies))
 
 
 def load_training_config(path: Path | None = None, *, experiment_path: Path | None = None) -> dict:

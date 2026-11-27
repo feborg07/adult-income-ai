@@ -7,11 +7,42 @@ import pandas as pd
 from sklearn.base import clone
 
 from src.data.preprocess import (
+    ABLATION_FEATURES,
     PreprocessingConfig,
     build_preprocessor,
     create_cv_folds,
 )
 from src.models.tasks import binary_classification as binary
+
+
+# Fixed across all approved representations, including the full-input control.
+COMMON_GROUPING_EXCLUSIONS = ABLATION_FEATURES
+COMMON_GROUPING_POLICY = "common_retained_raw_predictors_v1"
+
+
+def resolve_cv_representation(config: dict) -> dict:
+    """Resolve model inputs independently of the universal CV grouping policy.
+
+    Missing representation settings still select full model inputs. Every
+    approved representation uses the same raw grouping columns and split seed
+    settings supplied by the caller, including the full-input control.
+    """
+    policies = {
+        "control": (),
+        "no_fnlwgt": ("fnlwgt",),
+        "no_fnlwgt_race": ("fnlwgt", "race"),
+        "no_fnlwgt_sex": ("fnlwgt", "sex"),
+        "no_fnlwgt_demographics": ("fnlwgt", "race", "sex"),
+    }
+    name = config.get("cv_representation", "control")
+    if not isinstance(name, str) or name not in policies:
+        raise ValueError("cv_representation must be one of: " + ", ".join(policies))
+    return {
+        "representation": name,
+        "excluded_features": policies[name],
+        "grouping_excluded_features": COMMON_GROUPING_EXCLUSIONS,
+        "grouping_policy": COMMON_GROUPING_POLICY,
+    }
 
 
 @dataclass(frozen=True)

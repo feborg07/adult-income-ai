@@ -23,7 +23,9 @@ def test_selected_policy():
     assert policy["representation"] == "no_fnlwgt"
     assert policy["excluded_features"] == ("fnlwgt",)
     assert policy["grouping_excluded_features"] == ("fnlwgt", "race", "sex")
+    assert training.resolve_cv_representation({}) == training.resolve_cv_representation({"cv_representation": "control"})
     assert training.resolve_cv_representation({})["excluded_features"] == ()
+    assert training.resolve_cv_representation({})["grouping_excluded_features"] == ("fnlwgt", "race", "sex")
 
 
 @pytest.mark.parametrize("value", [None, [], {}, "unknown", "representation_a"])
@@ -38,12 +40,13 @@ def test_invalid_policy(value, tmp_path):
 
 
 @pytest.mark.parametrize("name,excluded", [
+    ("control", ()),
     ("no_fnlwgt", ("fnlwgt",)),
     ("no_fnlwgt_race", ("fnlwgt", "race")),
     ("no_fnlwgt_sex", ("fnlwgt", "sex")),
     ("no_fnlwgt_demographics", ("fnlwgt", "race", "sex")),
 ])
-def test_reduced_policies_share_grouping(name, excluded):
+def test_all_policies_share_grouping(name, excluded):
     """Resolve each approved representation with the same conservative grouping."""
     policy = training.resolve_cv_representation({"cv_representation": name})
     assert policy["excluded_features"] == excluded
@@ -125,6 +128,8 @@ def test_optuna_representation_change_isolated(optuna_workspace, tracked_mlflow,
     second, _, _ = run_and_read(args)
     assert first["optuna_context_id"] != second["optuna_context_id"]
     assert second["excluded_features"] == []
+    assert second["fold_sha256"] == first["fold_sha256"]
+    assert second["grouping_policy"] == first["grouping_policy"]
     assert second["optuna_cumulative_successful_candidates"] == 1
 
 

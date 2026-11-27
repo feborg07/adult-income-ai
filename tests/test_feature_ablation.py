@@ -157,15 +157,23 @@ def test_failed_candidate_has_no_success_summary(representation_workspace, track
     assert not list(args.output_dir.rglob("ablation_summary.json"))
 
 
-def test_common_scope_independence(representation_workspace, tracked_mlflow):
-    """All five representations reuse the same partitions as the initial pair."""
+def test_common_scope_independence(representation_workspace, tracked_mlflow, tmp_path):
+    """Even a reduced plan uses the same grouping as the full five-representation plan."""
     args = workspace_args(representation_workspace)
+    original_plan = args.plan
+    plan = ablation.load_plan(original_plan)
+    reduced_plan = {**plan, "representations": {
+        name: plan["representations"][name] for name in args.representations}}
+    args.plan = tmp_path / "reduced_ablation.yml"
+    args.plan.write_text(yaml.safe_dump(reduced_plan), encoding="utf-8")
     first = json.loads((ablation.run_ablation(args) / "ablation_summary.json").read_text())
-    args.representations = list(ablation.load_plan(args.plan)["representations"])
+    args.plan = original_plan
+    args.representations = list(plan["representations"])
     output = ablation.run_ablation(args)
     second = json.loads((output / "ablation_summary.json").read_text())
     assert first["fold_sha256"] == second["fold_sha256"]
     assert first["fold_balance"] == second["fold_balance"]
+    assert first["settings"]["grouping_excluded_features"] == ["fnlwgt", "race", "sex"]
     assert second["candidate_count"] == 10
     assert pd.read_csv(output / "ablation_duplicate_audit.csv").shared_groups.eq(0).all()
 
