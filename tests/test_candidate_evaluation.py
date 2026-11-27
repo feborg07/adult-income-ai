@@ -66,12 +66,12 @@ def test_canonical_metadata_hash(tmp_path, monkeypatch):
     """Accept equivalent JSON formatting but reject changed frozen content."""
     path = tmp_path / 'frozen_plan.json'
     obj = {'seed': 42, 'threshold': .35}
-    monkeypatch.setattr(evaluation, 'METADATA_SHA', {path.name: evaluation.canonical_sha(obj)})
+    anchors = {path.name: evaluation.canonical_sha(obj)}
     path.write_text(json.dumps(obj, indent=4))
-    assert evaluation.anchored_json(path) == obj
+    assert evaluation.anchored_json(path, anchors) == obj
     path.write_text(json.dumps(dict(obj, threshold=.5)))
     with pytest.raises(ValueError, match='Frozen metadata changed'):
-        evaluation.anchored_json(path)
+        evaluation.anchored_json(path, anchors)
 
 
 def test_file_checksum(tmp_path):
@@ -156,7 +156,7 @@ def test_performance_gate(selected, unseen, passed):
     rows = [{'candidate': 'xgboost', 'test_f1': selected, 'unseen_test_f1': unseen},
             {'candidate': 'reference', 'test_f1': .72, 'unseen_test_f1': .74},
             {'candidate': 'other', 'test_f1': .99, 'unseen_test_f1': .99}]
-    result = evaluation.performance_gate(rows)
+    result = evaluation.performance_gate(rows, 'xgboost')
     assert result['passed'] is passed
     assert result['selected_candidate'] == 'xgboost'
     assert result['promotion_authorized'] is False
@@ -186,14 +186,20 @@ def test_alignment_checks_original_matrix(synthetic_partitions, fitted_models, t
 
 def test_preflight_default_never_scores(monkeypatch):
     """Default CLI performs only the development preflight, never test evaluation."""
-    verified = object()
+    context = evaluation.EvaluationContext('a'*32, 'synthetic', {'metadata': 'hash'})
+    verified = ({'synthetic': {'model_sha256':'candidate-sha','val_f1':.72,'threshold':.35}},
+                {}, {}, {'model_sha256': 'sha'}, (), context)
     monkeypatch.setattr(evaluation, 'preflight', Mock(return_value=verified))
     scorer = Mock()
     monkeypatch.setattr(evaluation, 'run_evaluation', scorer)
-    evaluation.main([])
+    args = ['--run-id', context.run_id]
+    evaluation.main(args)
     scorer.assert_not_called()
-    evaluation.main(['--evaluate'])
-    scorer.assert_called_once_with(evaluation.ROOT, verified)
+    with pytest.raises(ValueError, match='approval SHA-256 mismatch'):
+        evaluation.main(args + ['--evaluate'])
+    scorer.assert_not_called()
+    evaluation.main(args + ['--evaluate', '--approval-sha256', context.approval_sha256])
+    scorer.assert_called_once_with(evaluation.ROOT, verified, approval_sha256=context.approval_sha256)
 
 
 def test_failed_preflight_prevents_scoring(monkeypatch):
@@ -202,7 +208,7 @@ def test_failed_preflight_prevents_scoring(monkeypatch):
     scorer = Mock()
     monkeypatch.setattr(evaluation, 'run_evaluation', scorer)
     with pytest.raises(ValueError, match='bad model'):
-        evaluation.main(['--evaluate'])
+        evaluation.main(['--run-id', 'a'*32, '--evaluate'])
     scorer.assert_not_called()
 
 
@@ -228,7 +234,14 @@ def test_report_integration(synthetic_partitions, fitted_models, tmp_path, monke
     monkeypatch.setattr(evaluation.training, 'configure_mlflow', Mock())
     tracker = MagicMock()
     monkeypatch.setattr(evaluation.training, 'mlflow', tracker)
-    output = evaluation.run_evaluation(root, (specs, models, {}, {}, (*dev, config)))
+    # Nonselected candidates are verified but never scored against the historical test set.
+    other = Mock()
+    other.predict_proba.side_effect = AssertionError('Nonselected candidate scored')
+    models['other'] = other
+    specs['other'] = dict(specs['xgboost'], candidate='other')
+    context = evaluation.EvaluationContext('a'*32, 'xgboost', {})
+    output = evaluation.run_evaluation(root, (specs, models, {}, {}, (*dev, config), context),
+                                       approval_sha256=context.approval_sha256)
     summary = json.loads((output / 'heldout_summary.json').read_text())
     assert summary['test_rows'] == len(Xtest) and len(summary['candidates']) == 2
     assert summary['promotion_authorized'] is False
@@ -260,7 +273,7 @@ def test_development_fingerprints(synthetic_partitions, tmp_path, monkeypatch):
     identity = {'raw_training_sha256': evaluation.training.file_sha256(folder / 'baseline/raw_train.csv'),
                 'raw_validation_sha256': evaluation.training.file_sha256(folder / 'baseline/raw_val.csv'),
                 'fold_sha256': fold_hash, 'calibration_split_sha256': hashlib.sha256(json.dumps([fit.tolist(), cal.tolist()]).encode()).hexdigest(),
-                'fit_rows': len(fit), 'calibration_rows': len(cal),
+                'fit_rows': len(fit), 'calibration_rows': len(cal), 'validation_rows': len(Xv),
                 'unseen_validation_rows': int(evaluation.unseen_mask(X, Xv).sum())}
     plan = {'seed': 42, 'calibration_size': .2, 'candidates': {'synthetic': {'variant': 'baseline', 'effective_preprocessing_sha256': config_hash}}}
     monkeypatch.setattr(evaluation, 'EXPECTED_ROWS', (len(X), len(Xv), 0))
@@ -319,3 +332,128 @@ def test_reference_historical_ranking_parity(synthetic_partitions, fitted_models
     bad[0] = .1
     with pytest.raises(ValueError, match='class predictions differ'):
         evaluation.verify_pipeline(model, spec, Xv, yv, unseen, historical_prob=bad)
+
+
+def test_validation_winner_and_approval_binding():
+    """Select an arbitrary validation winner and bind approval to the active reference."""
+    rows = [{'candidate': 'future', 'val_f1': .75, 'test_f1': .1},
+            {'candidate': 'other', 'val_f1': .7, 'test_f1': .99}]
+    assert evaluation.select_validation_winner(rows) == 'future'
+    with pytest.raises(ValueError, match='Validation tie'):
+        evaluation.select_validation_winner([dict(r, val_f1=.75) for r in rows])
+    with pytest.raises(ValueError, match='Validation F1 gate'):
+        evaluation.select_validation_winner([dict(rows[0], val_f1=.6)])
+    ctx = evaluation.EvaluationContext('a'*32, 'future', {'reference': 'old'})
+    assert ctx.approval_sha256 != evaluation.EvaluationContext('a'*32, 'future', {'reference': 'new'}).approval_sha256
+    assert ctx.approval_sha256 != evaluation.EvaluationContext('b'*32, 'future', ctx.anchors).approval_sha256
+
+
+def test_reduced_reference_test_alignment(synthetic_partitions, tmp_path, monkeypatch):
+    """Check saved hashes without transforming the full matrix with a reduced reference."""
+    _, _, _, (X, y) = synthetic_partitions
+    saved = {}
+    for variant in evaluation.VARIANTS:
+        folder = tmp_path / 'data/processed' / variant
+        folder.mkdir(parents=True)
+        X.to_csv(folder / 'X_test.csv', index=False)
+        y.to_csv(folder / 'y_test.csv', index=False)
+        saved[variant] = {name: evaluation.training.file_sha256(folder / name)
+                          for name in ('X_test.csv', 'y_test.csv')}
+    monkeypatch.setattr(evaluation, 'EXPECTED_ROWS', (0, 0, len(X)))
+    model = Mock()
+    ref = {'evidence': {'heldout': {'saved_test_sha256': saved}}}
+    assert evaluation.verify_test_alignment(tmp_path, X, y, model, ref) == saved
+    assert not model.mock_calls
+    (tmp_path / 'data/processed/robust/X_test.csv').write_text('tampered')
+    with pytest.raises(ValueError, match='checksum mismatch'):
+        evaluation.verify_test_alignment(tmp_path, X, y, model, ref)
+
+
+def test_preflight_future_run_with_promoted_reference(synthetic_partitions, fitted_models, tmp_path, monkeypatch):
+    """Verify a new arbitrary shortlist against a reduced reference with no test files."""
+    from dataclasses import asdict
+    from src.data.preprocess import create_cv_folds, save_config
+
+    _, config, (X, y, Xv, yv), _ = synthetic_partitions
+    X, y, Xv, yv = (obj.reset_index(drop=True) for obj in (X, y, Xv, yv))
+    models, specs, _ = fitted_models
+    for variant in evaluation.VARIANTS:
+        folder = tmp_path / 'data/processed' / variant
+        folder.mkdir(parents=True)
+        X.assign(income=y).to_csv(folder / 'raw_train.csv', index=False)
+        Xv.assign(income=yv).to_csv(folder / 'raw_val.csv', index=False)
+        save_config(config, folder / 'preprocessing_config.json')
+    baseline = tmp_path / 'data/processed/baseline'
+    folds = create_cv_folds(X, y, grouping_excluded_features=evaluation.GROUPING_EXCLUSIONS)
+    fit, cal = evaluation.calibration_indices(X, y, .2, 42)
+    run_id = 'a'*32
+    identity = dict(execution_id=run_id, evaluation_protocol='shortlist_validation', test_accessed=False,
+                    representation='no_fnlwgt', raw_training_sha256=evaluation.training.file_sha256(baseline/'raw_train.csv'),
+                    raw_validation_sha256=evaluation.training.file_sha256(baseline/'raw_val.csv'),
+                    fold_sha256=hashlib.sha256(json.dumps([[p.tolist() for p in f] for f in folds]).encode()).hexdigest(),
+                    grouping_excluded_features=list(evaluation.GROUPING_EXCLUSIONS), overlap_excluded_features=list(evaluation.OVERLAP_EXCLUSIONS),
+                    fit_rows=len(fit), calibration_rows=len(cal), validation_rows=len(Xv),
+                    unseen_validation_rows=int(evaluation.unseen_mask(X, Xv).sum()),
+                    calibration_split_sha256=hashlib.sha256(json.dumps([fit.tolist(), cal.tolist()]).encode()).hexdigest())
+    candidate = 'future_candidate'
+    run = tmp_path/'models/runs'/run_id
+    folder = run/candidate
+    folder.mkdir(parents=True)
+    model = models['xgboost']
+    path = folder/'model_pipeline.joblib'
+    joblib.dump(model, path)
+    spec = dict(specs['xgboost'], candidate=candidate, model_sha256=evaluation.training.file_sha256(path))
+    spec.update(effective_preprocessing_sha256=hashlib.sha256(json.dumps(asdict(replace(config, excluded_features=('fnlwgt',))),sort_keys=True).encode()).hexdigest())
+    plan = dict(seed=42, calibration_size=.2, representation='no_fnlwgt', raw_training_sha256=identity['raw_training_sha256'],
+                fold_sha256=identity['fold_sha256'], candidates={candidate:{k:spec[k] for k in ('family','variant','effective_preprocessing_sha256')}})
+    for path, value in ((folder/'validation_result.json',spec), (run/'frozen_plan.json',plan),
+                        (run/'partition_identity.json',identity), (run/'candidate_validation_summary.json',dict(identity,candidates=[spec]))):
+        path.write_text(json.dumps(value))
+    ref = tmp_path/'models/reference'
+    ref.mkdir()
+    joblib.dump(model, ref/'best_model_pipeline.joblib')
+    metadata = dict(model_filename='best_model_pipeline.joblib', model_sha256=evaluation.training.file_sha256(ref/'best_model_pipeline.joblib'),
+                    positive_class=1, representation='no_fnlwgt', model_family='logistic_regression', preprocessing_variant='baseline',
+                    decision_threshold=spec['threshold'], validation_f1=spec['val_f1'], validation_pr_auc=spec['val_pr_auc'],
+                    validation_roc_auc=spec['val_roc_auc'], mlflow_run_id='previous',
+                    dataset_sha256={'raw_train.csv':identity['raw_training_sha256'],'raw_val.csv':identity['raw_validation_sha256']})
+    (ref/'best_model_metadata.json').write_text(json.dumps(metadata))
+    monkeypatch.setattr(evaluation, 'EXPECTED_ROWS', (len(X),len(Xv),0))
+    monkeypatch.setattr(evaluation, 'MIN_VALIDATION_F1', 0.)  # Synthetic models need not meet the production gate.
+    verified = evaluation.preflight(tmp_path, run_id)
+    assert verified[-1].selected == candidate
+    assert verified[0]['reference']['representation'] == 'no_fnlwgt'
+    assert not (tmp_path/'data/raw').exists()
+    # A changed frozen reference changes the approval identity even with identical model bytes.
+    metadata['mlflow_run_id'] = 'another-release'
+    (ref/'best_model_metadata.json').write_text(json.dumps(metadata))
+    changed = evaluation.preflight(tmp_path, run_id)
+    assert changed[-1].approval_sha256 != verified[-1].approval_sha256
+    with pytest.raises(ValueError, match='Preflight approval'):
+        evaluation.run_evaluation(tmp_path, changed, approval_sha256=verified[-1].approval_sha256)
+
+
+def test_paired_robustness_uses_exact_scenarios(synthetic_partitions, fitted_models, tmp_path):
+    """Bind both robustness reports to verified drift data and reject changed labels."""
+    from scripts import evaluate_fairness as audit
+    from src.data import drift_generator as drift
+
+    _, _, _, (X, y) = synthetic_partitions
+    models, specs, _ = fitted_models
+    root = tmp_path/'data/drift'
+    drift.save_drift_scenarios(X, y, root, verification={'verified': True})
+    mask = np.ones(len(X), dtype=bool)
+    report = {'execution_id':'b'*32, 'candidates':[evaluation.score_model(model,specs[name],X,y,mask)
+                                                for name,model in models.items()]}
+    context = evaluation.EvaluationContext('a'*32,'xgboost',{})
+    target = root/'severe/y_test.csv'
+    original = target.read_bytes()
+    (1-y).to_csv(target,index=False)
+    with pytest.raises(AssertionError):
+        audit.run_paired_robustness(tmp_path, report, specs, models, X, y, context)
+    target.write_bytes(original)
+    output = audit.run_paired_robustness(tmp_path, report, specs, models, X, y, context)
+    for name in ('xgboost','reference'):
+        result = evaluation.read_json(output/name/'robustness_report.json')
+        assert result['heldout_execution_id'] == report['execution_id']
+        assert set(result['scenario_file_sha256']) == set(drift.SCENARIOS)

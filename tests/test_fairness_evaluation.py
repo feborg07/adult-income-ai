@@ -137,45 +137,48 @@ def synthetic_report(synthetic_audit, monkeypatch):
                     'run_id': name, 'family': name, 'variant': 'baseline'} for name in ('xgboost', 'reference')}
     rows = [dict(expected, candidate=name, **spec) for name, spec in specs.items()]
     identity = {'synthetic': True}
-    report = {'execution_id': 'synthetic-heldout', 'source_execution_id': e.EXECUTION,
+    context = e.EvaluationContext('a'*32, 'xgboost', {'reference': 'hash'})
+    report = {'execution_id': 'synthetic-heldout', 'source_execution_id': context.run_id,
               'evaluation_protocol': 'frozen_heldout', 'selected_candidate': 'xgboost', 'partition_identity': identity,
-              'frozen_metadata_content_sha256': e.METADATA_SHA, 'test_accessed': True,
+              'frozen_metadata_content_sha256': context.anchors, 'preflight_approval_sha256': context.approval_sha256, 'test_accessed': True,
               'historical_test_previously_used': True, 'promotion_authorized': False,
               'test_rows': len(X), 'unseen_test_rows': int(unseen.sum()),
               'overlap_excluded_features': list(e.OVERLAP_EXCLUSIONS), 'candidates': rows,
-              'performance_gate': e.performance_gate(rows), 'raw_source_sha256': {'adult.data': 'a', 'adult.test': 'b'},
+              'performance_gate': e.performance_gate(rows, context.selected), 'raw_source_sha256': {'adult.data': 'a', 'adult.test': 'b'},
               'saved_test_sha256': {'baseline': {}}, 'unseen_mask_sha256': hashlib.sha256(unseen.astype('uint8').tobytes()).hexdigest()}
-    return report, identity, specs
+    return report, identity, specs, context
 
 
-@pytest.mark.parametrize('mutation', ['identity', 'threshold', 'gate', 'duplicate'])
+@pytest.mark.parametrize('mutation', ['identity', 'threshold', 'gate', 'duplicate', 'approval'])
 def test_report_binding(synthetic_report, mutation):
     """Reject altered partition identity, threshold, gate or shortlist."""
-    report, identity, specs = synthetic_report
-    assert set(audit.verify_report(report, identity, specs)) == set(specs)
+    report, identity, specs, context = synthetic_report
+    assert set(audit.verify_report(report, identity, specs, context)) == set(specs)
     if mutation == 'identity':
         report['partition_identity'] = {}
     elif mutation == 'threshold':
         report['candidates'][0]['threshold'] = .5
     elif mutation == 'gate':
         report['performance_gate']['passed'] = False
+    elif mutation == 'approval':
+        report['preflight_approval_sha256'] = 'wrong'
     else:
         report['candidates'].append(report['candidates'][0])
     with pytest.raises(ValueError):
-        audit.verify_report(report, identity, specs)
+        audit.verify_report(report, identity, specs, context)
 
 
 def test_run_audit_writes_aggregate_reports(tmp_path, monkeypatch, synthetic_audit, synthetic_report):
     """Verify report generation and mocked tracking with no model fitting."""
     X, y, p, unseen, _ = synthetic_audit
-    report, identity, specs = synthetic_report
+    report, identity, specs, context = synthetic_report
     path = tmp_path / 'heldout_summary.json'
     path.write_text(json.dumps(report))
     models = {name: MagicMock() for name in specs}
     for spec in specs.values():
         spec['path'] = tmp_path / 'synthetic.joblib'
     e = audit.heldout
-    monkeypatch.setattr(e, 'preflight', lambda root: (specs, models, identity, {}, (X, y, X, y, None)))
+    monkeypatch.setattr(e, 'preflight', lambda root, run_id: (specs, models, identity, {}, (X, y, X, y, None), context))
     monkeypatch.setattr(e, 'verify_file', MagicMock())
     monkeypatch.setattr(e, 'reconstruct_partitions', lambda *args: (X, y))
     monkeypatch.setattr(e, 'verify_test_alignment', lambda *args: report['saved_test_sha256'])

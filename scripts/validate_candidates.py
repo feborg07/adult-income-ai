@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import uuid
+import re
 import warnings
 
 import joblib
@@ -17,11 +18,12 @@ from src.data.preprocess import (
     create_train_test_split, load_untransformed_partition, predictor_group_ids,
 )
 from src.models import train as training
+from src.models.cross_validation import COMMON_GROUPING_EXCLUSIONS
 from src.models.configuration import read_mapping
 from src.models.tasks import binary_classification as binary
 
 ROOT = Path(__file__).resolve().parents[1]
-GROUPING_EXCLUSIONS = ('fnlwgt', 'race', 'sex')
+GROUPING_EXCLUSIONS = COMMON_GROUPING_EXCLUSIONS
 # All shortlisted preprocessing variants remove the redundant education string.
 OVERLAP_EXCLUSIONS = ('fnlwgt', 'education')
 
@@ -88,7 +90,12 @@ def run_validation(args):
     settings = training.resolve_cv_settings(config)
     if config['seed'] != plan['seed'] or settings['calibration_size'] != plan['calibration_size']:
         raise ValueError('Frozen calibration settings mismatch.')
+    if settings['n_splits'] != plan.get('n_splits', 3):
+        raise ValueError('Frozen fold count mismatch.')
     candidates = plan['candidates']
+    if not candidates or any(not isinstance(name, str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', name)
+                             or name == 'reference' for name in candidates):
+        raise ValueError('Invalid candidate identifiers.')
     variants = sorted({spec['variant'] for spec in candidates.values()})
     for variant in variants:
         if training.file_sha256(processed / variant / 'raw_train.csv') != plan['raw_training_sha256']:
@@ -177,7 +184,7 @@ def run_validation(args):
 def main():
     """Parse arguments and run validation without accessing the held-out test set."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--plan', type=Path, default=ROOT / 'configs/candidate_validation.yml')
+    parser.add_argument('--plan', type=Path, required=True, help='Reviewed frozen candidate plan YAML.')
     parser.add_argument('--config', type=Path, default=ROOT / 'configs/config.yml')
     parser.add_argument('--processed-dir', type=Path)
     parser.add_argument('--output-dir', type=Path)

@@ -94,8 +94,20 @@ def env(tmp_path):
                        name:p.canonical_sha(value) for name,value in (
                            ('candidate_validation_summary.json',summary),('frozen_plan.json',plan),
                            ('partition_identity.json',identity),(p.METADATA_FILENAME,old))})
+    heldout['preflight_approval_sha256'] = p.evaluation_approval_sha256(run_id, 'candidate', heldout['frozen_metadata_content_sha256'])
     hp=root/'reports/heldout'/held_id/'heldout_summary.json'
     write(hp,heldout)
+    drift = dict(reference_verification={'verified':True},reference_rows=10,
+                 scenarios={s:{'rows':10} for s in p.SCENARIOS})
+    write(root/'data/drift/drift_metadata.json', drift)
+    hashes = {}
+    for scenario in p.SCENARIOS:
+        hashes[scenario] = {}
+        for filename in ('X_test.csv', 'y_test.csv'):
+            file = root/'data/drift'/scenario/filename
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b'scenario data')
+            hashes[scenario][filename] = p.sha256_file(file)
     groups,disparities=[],[]
     for row in (selected,reference):
         for part in ('test','unseen_test'):
@@ -103,17 +115,16 @@ def env(tmp_path):
                 base=dict(candidate=row['candidate'],partition=part,attribute=attr)
                 groups.append(dict(**base,rows=10,threshold=row['threshold'],tn=5,fp=1,fn=1,tp=3))
                 disparities.append(base)
-        write(root/'reports/robustness/phase4'/row['candidate']/'robustness_report.json',dict(
+        write(root/'reports/robustness'/held_id/row['candidate']/'robustness_report.json',dict(
+            heldout_execution_id=held_id, drift_metadata_sha256=p.canonical_sha(drift), scenario_file_sha256=hashes,
             reference_model=dict(model_family=row['family'],preprocessing_variant='baseline',
                                  model_sha256=row['model_sha256'],decision_threshold=row['threshold']),
             scenarios={s:dict(**metrics,rows=10) for s in p.SCENARIOS}))
     fp=root/'reports/fairness'/fair_id/'fairness_summary.json'
     write(fp,dict(**partition,execution_id=fair_id,heldout_execution_id=held_id,source_execution_id=run_id,
-                  heldout_summary_sha256=p.sha256_file(hp),heldout_evaluator_sha256=heldout['evaluator_sha256'],
+                  preflight_approval_sha256=heldout['preflight_approval_sha256'], heldout_summary_sha256=p.sha256_file(hp),heldout_evaluator_sha256=heldout['evaluator_sha256'],
                   models={r['candidate']:{k:r[k] for k in ('model_sha256','threshold','representation')}
                           for r in (selected,reference)},subgroups=groups,disparities=disparities))
-    write(root/'data/drift/drift_metadata.json',dict(reference_verification={'verified':True},reference_rows=10,
-                                                     scenarios={s:{'rows':10} for s in p.SCENARIOS}))
     return SimpleNamespace(root=root, ids=(run_id,held_id,fair_id),model=model,ref=ref,old=old,heldout=hp,fairness=fp,run=run)
 
 
@@ -229,7 +240,7 @@ def test_missing_fairness_groups(env):
 
 def test_missing_robustness(env):
     """Require all drift scenarios."""
-    path=env.root/'reports/robustness/phase4/candidate/robustness_report.json'
+    path=env.root/'reports/robustness'/env.ids[1]/'candidate/robustness_report.json'
     modify(path,scenarios={})
     with pytest.raises(ValueError,match='Missing robustness scenarios'):
         run(env)
@@ -237,7 +248,7 @@ def test_missing_robustness(env):
 
 def test_robustness_control_mismatch(env):
     """Require control scores to reproduce held-out metrics."""
-    path=env.root/'reports/robustness/phase4/candidate/robustness_report.json'
+    path=env.root/'reports/robustness'/env.ids[1]/'candidate/robustness_report.json'
     scenarios=p.load_json(path)['scenarios']
     scenarios['control']['f1']=.5
     modify(path,scenarios=scenarios)
@@ -348,3 +359,10 @@ def test_missing_pointer_blocks_promotion(env):
         confirm(env)
     assert p.load_json(env.ref / p.METADATA_FILENAME) == env.old
     assert not list((env.root / 'models/reference_history').iterdir())
+
+
+def test_changed_drift_data(env):
+    """Reject altered synthetic scenarios after the paired robustness assessment."""
+    (env.root/'data/drift/severe/X_test.csv').write_bytes(b'changed')
+    with pytest.raises(ValueError, match='checksum mismatch|Checksum mismatch|SHA-256 mismatch'):
+        run(env)

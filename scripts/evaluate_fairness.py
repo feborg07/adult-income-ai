@@ -15,7 +15,6 @@ from scripts import evaluate_candidates as heldout
 from src.models.tasks import binary_classification as binary
 
 ROOT = heldout.ROOT
-DEFAULT_SUMMARY = Path('reports/heldout/0ec5ef02dda340aa93ba9c65aa7e838b/heldout_summary.json')
 GROUPINGS = (('sex',), ('race',), ('sex', 'race'))
 # Descriptive support flag, not an acceptance threshold or significance test.
 MIN_SUPPORT = 30
@@ -85,11 +84,12 @@ def disparity_summary(rows):
     return result
 
 
-def verify_report(report, identity, specs):
+def verify_report(report, identity, specs, context):
     """Bind the audit to the completed held-out evaluation and frozen model identities."""
-    expected = {'source_execution_id': heldout.EXECUTION, 'evaluation_protocol': 'frozen_heldout',
-                'selected_candidate': heldout.SELECTED, 'partition_identity': identity,
-                'frozen_metadata_content_sha256': heldout.METADATA_SHA,
+    expected = {'source_execution_id': context.run_id, 'evaluation_protocol': 'frozen_heldout',
+                'selected_candidate': context.selected, 'partition_identity': identity,
+                'preflight_approval_sha256': context.approval_sha256,
+                'frozen_metadata_content_sha256': context.anchors,
                 'test_accessed': True, 'historical_test_previously_used': True,
                 'promotion_authorized': False, 'test_rows': heldout.EXPECTED_ROWS[2],
                 'unseen_test_rows': heldout.EXPECTED_UNSEEN,
@@ -97,13 +97,14 @@ def verify_report(report, identity, specs):
     heldout.require(all(report.get(k) == v for k, v in expected.items()), 'Held-out report identity mismatch.')
     rows = report['candidates']
     by_name = {row['candidate']: row for row in rows}
-    heldout.require(len(rows) == len(by_name) == len(specs) and set(by_name) == set(specs),
+    heldout.require(len(rows) == len(by_name) == 2 and set(by_name) == {context.selected, heldout.REFERENCE},
                     'Held-out shortlist mismatch.')
-    for name, spec in specs.items():
+    for name in by_name:
+        spec = specs[name]
         heldout.require(all(by_name[name].get(k) == spec[k] for k in
                            ('model_sha256', 'threshold', 'representation', 'run_id', 'family', 'variant')),
                         f'Held-out model identity mismatch: {name}')
-    gate = heldout.performance_gate(rows)
+    gate = heldout.performance_gate(rows, context.selected)
     heldout.require(gate == report['performance_gate'] and gate['passed'], 'Held-out performance gate mismatch.')
     return by_name
 
@@ -137,11 +138,11 @@ def audit_predictions(X, y, probabilities, threshold, unseen, expected):
     return rows, gaps
 
 
-def run_audit(root, summary_path):
+def run_audit(root, summary_path, *, include_robustness=False):
     """Verify frozen provenance, reconstruct test rows, and write aggregate-only audit reports."""
     report = heldout.read_json(summary_path)
-    specs, models, identity, ref, development = heldout.preflight(root)
-    expected = verify_report(report, identity, specs)
+    specs, models, identity, ref, development, context = heldout.preflight(root, report['source_execution_id'])
+    expected = verify_report(report, identity, specs, context)
     X, y, Xval, yval, config = development
     raw = [root / 'data/raw' / name for name in ('adult.data', 'adult.test')]
     for path in raw:
@@ -155,25 +156,27 @@ def run_audit(root, summary_path):
     heldout.require(int(unseen.sum()) == heldout.EXPECTED_UNSEEN and mask_sha == report['unseen_mask_sha256'],
                     'Held-out unseen subset mismatch.')
     rows, gaps = [], []
-    for name in (heldout.SELECTED, heldout.REFERENCE):
+    for name in (context.selected, heldout.REFERENCE):
         probabilities = binary.positive_probabilities(models[name], Xtest)
         metrics, disparities = audit_predictions(Xtest, ytest, probabilities, specs[name]['threshold'], unseen, expected[name])
         rows.extend(metrics)
         gaps.extend(disparities)
     for spec in specs.values():
         heldout.verify_file(spec['path'], spec['model_sha256'])
+    if include_robustness:
+        run_paired_robustness(root, report, specs, models, Xtest, ytest, context)
     execution = uuid.uuid4().hex
     output = root / 'reports/fairness' / execution
     output.mkdir(parents=True, exist_ok=False)
     audit = {'execution_id': execution, 'heldout_execution_id': report['execution_id'],
              'heldout_summary_sha256': heldout.training.file_sha256(summary_path),
-             'source_execution_id': heldout.EXECUTION, 'git_commit': heldout.training.git_revision(),
+             'source_execution_id': context.run_id, 'preflight_approval_sha256': context.approval_sha256, 'git_commit': heldout.training.git_revision(),
              'evaluator_sha256': heldout.training.file_sha256(Path(__file__)),
              'heldout_evaluator_sha256': heldout.training.file_sha256(Path(heldout.__file__)),
              'raw_source_sha256': report['raw_source_sha256'], 'saved_test_sha256': hashes,
              'unseen_mask_sha256': mask_sha, 'test_rows': len(Xtest), 'unseen_test_rows': int(unseen.sum()),
              'models': {name: {k: specs[name][k] for k in ('model_sha256', 'threshold', 'representation')}
-                        for name in (heldout.SELECTED, heldout.REFERENCE)},
+                        for name in (context.selected, heldout.REFERENCE)},
              'methodology': {'positive_class': 1, 'weighting': 'unweighted observations for both models',
                              'groupings': [list(g) for g in GROUPINGS], 'gap': 'maximum minus minimum across observed groups',
                              'undefined_rate': 'null; gaps undefined if any group rate is undefined',
@@ -206,13 +209,66 @@ def run_audit(root, summary_path):
     return output
 
 
+def run_paired_robustness(root, report, specs, models, Xtest, ytest, context):
+    """Score both frozen models against the same verified deterministic drift scenarios."""
+    from src.data import drift_generator as drift
+    from src.models import robustness
+
+    run_id = report['execution_id']
+    heldout.require(isinstance(run_id, str) and len(run_id) == 32 and
+                    all(c in '0123456789abcdef' for c in run_id), 'Invalid held-out execution ID.')
+    drift_root = root / 'data/drift'
+    metadata_path = drift_root / 'drift_metadata.json'
+    metadata = heldout.read_json(metadata_path)
+    heldout.require(metadata['reference_verification']['verified'] is True and
+                    metadata['reference_rows'] == len(Xtest) and
+                    set(metadata['scenarios']) == set(drift.SCENARIOS), 'Drift provenance mismatch.')
+    scenarios, hashes = {}, {}
+    for scenario in drift.SCENARIOS:
+        path = drift_root / scenario
+        X, y = robustness.load_dataset(path / 'X_test.csv', path / 'y_test.csv')
+        expected = drift.generate_drift_scenario(Xtest, scenario, metadata['random_state'])
+        heldout.assert_partition_equal(X, y, expected, ytest, f'drift {scenario}')
+        heldout.require(metadata['scenarios'][scenario]['sha256'] == drift.dataframe_sha256(expected),
+                        f'Drift fingerprint mismatch: {scenario}')
+        scenarios[scenario] = (X, y)
+        hashes[scenario] = {name: heldout.training.file_sha256(path / name)
+                            for name in ('X_test.csv', 'y_test.csv')}
+    results = {}
+    for name in (context.selected, heldout.REFERENCE):
+        spec = specs[name]
+        scores = {scenario: robustness.evaluate_model(models[name], X, y, spec['threshold'])
+                  for scenario, (X, y) in scenarios.items()}
+        control = next(row for row in report['candidates'] if row['candidate'] == name)
+        for key, value in scores['control'].items():
+            field = 'test_' + key
+            if field in control:
+                heldout.require(value == control[field], f'Robustness control mismatch: {name}/{key}')
+        results[name] = scores
+    output = root / 'reports/robustness' / run_id
+    output.mkdir(parents=True, exist_ok=False)
+    for name, scores in results.items():
+        spec = specs[name]
+        meta = {'model_family': spec['family'], 'preprocessing_variant': spec['variant'],
+                'model_sha256': spec['model_sha256']}
+        path, _ = robustness.save_reports(scores, robustness.compare_to_control(scores), meta,
+                                           output / name, spec['threshold'])
+        record = heldout.read_json(path)
+        record.update(heldout_execution_id=run_id, drift_metadata_sha256=heldout.canonical_sha(metadata),
+                      scenario_file_sha256=hashes)
+        heldout.training.atomic_json_write(path, record)
+    print(f'Paired robustness reports: {output}')
+    return output
+
+
 def main(argv=None):
     """Run the audit against the previously approved held-out summary."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--heldout-summary', type=Path, default=DEFAULT_SUMMARY,
+    parser.add_argument('--heldout-summary', type=Path, required=True,
                         help='Path to the completed held-out summary JSON.')
+    parser.add_argument('--robustness', action='store_true', help='Also score paired deterministic drift scenarios.')
     args = parser.parse_args(argv)
-    run_audit(ROOT, ROOT / args.heldout_summary)
+    run_audit(ROOT, ROOT / args.heldout_summary, include_robustness=args.robustness)
 
 
 if __name__ == '__main__':

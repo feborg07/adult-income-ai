@@ -47,6 +47,14 @@ def canonical_sha(value):
                                      allow_nan=False).encode()).hexdigest()
 
 
+def evaluation_approval_sha256(run_id, selected, anchors):
+    """Bind pre-test approval to the frozen run, reference and fixed gate."""
+    return canonical_sha({'source_execution_id': run_id, 'selected_candidate': selected,
+                          'frozen_metadata_content_sha256': anchors, 'margin': MARGIN,
+                          'minimum_validation_f1': MIN_VALIDATION_F1,
+                          'test_policy': 'historical_adult_income_v1'})
+
+
 def load_json(path):
     """Load a JSON object, rejecting non-object records."""
     value = json.loads(Path(path).read_text(encoding='utf-8'))
@@ -88,7 +96,7 @@ def read_evidence(root, run_id, heldout_id, fairness_id):
     ref = root / 'models/reference'
     heldout_path = root / 'reports/heldout' / heldout_id / 'heldout_summary.json'
     fairness_path = root / 'reports/fairness' / fairness_id / 'fairness_summary.json'
-    robust = root / 'reports/robustness/phase4'
+    robust = root / 'reports/robustness' / heldout_id
     heldout = load_json(heldout_path)
     fairness = load_json(fairness_path)
     summary = load_json(run / 'candidate_validation_summary.json')
@@ -119,6 +127,10 @@ def read_evidence(root, run_id, heldout_id, fairness_id):
     winners = [r for r in rows if rate(r['val_f1']) == max(rate(x['val_f1']) for x in rows)]
     require(len(winners) == 1 and winners[0]['candidate'] == name, 'Candidate was not the unique validation winner')
     candidate = winners[0]
+    require(heldout['preflight_approval_sha256'] == evaluation_approval_sha256(run_id, name, anchors),
+            'Preflight approval mismatch')
+    require({r['candidate'] for r in heldout['candidates']} == {name, 'reference'} and
+            len(heldout['candidates']) == 2, 'Unexpected held-out candidates')
     require(candidate == load_json(run / name / 'validation_result.json') and
             all(candidate.get(k) == v for k,v in plan['candidates'][name].items()), 'Frozen candidate mismatch')
     require(rate(candidate['val_f1']) >= MIN_VALIDATION_F1, 'Validation F1 gate failed')
@@ -147,9 +159,12 @@ def read_evidence(root, run_id, heldout_id, fairness_id):
     require(fairness['execution_id'] == fairness_id and fairness['heldout_execution_id'] == heldout_id
             and fairness['source_execution_id'] == run_id, 'Fairness execution mismatch')
     verify_hash(heldout_path, fairness['heldout_summary_sha256'])
+    require(fairness['preflight_approval_sha256'] == heldout['preflight_approval_sha256'],
+            'Fairness preflight approval mismatch')
     for key in ('raw_source_sha256', 'saved_test_sha256', 'unseen_mask_sha256', 'test_rows', 'unseen_test_rows'):
         require(fairness[key] == heldout[key], f'Fairness partition mismatch: {key}')
     require(fairness['heldout_evaluator_sha256'] == heldout['evaluator_sha256'], 'Fairness evaluator mismatch')
+    drift = load_json(root / 'data/drift/drift_metadata.json')
     robust_reports = {}
     for label, row in ((name, selected), ('reference', reference)):
         fair = fairness['models'][label]
@@ -167,6 +182,14 @@ def read_evidence(root, run_id, heldout_id, fairness_id):
                 require(len([g for g in fairness['disparities'] if (g['candidate'],g['partition'],g['attribute']) == (label,partition,attribute)]) == 1,
                         'Missing fairness disparity review')
         report = load_json(robust / label / 'robustness_report.json')
+        require(report['heldout_execution_id'] == heldout_id and
+                report['drift_metadata_sha256'] == canonical_sha(drift), 'Robustness provenance mismatch')
+        hashes = report['scenario_file_sha256']
+        require(set(hashes) == SCENARIOS, 'Missing scenario fingerprints')
+        for scenario, files in hashes.items():
+            require(set(files) == {'X_test.csv', 'y_test.csv'}, 'Invalid scenario fingerprints')
+            for filename, digest in files.items():
+                verify_hash(root / 'data/drift' / scenario / filename, digest)
         meta = report['reference_model']
         require(meta['model_sha256'] == row['model_sha256'] and meta['decision_threshold'] == row['threshold'] and
                 meta['model_family'] == row['family'] and meta['preprocessing_variant'] == row['variant'],
@@ -180,7 +203,6 @@ def read_evidence(root, run_id, heldout_id, fairness_id):
         for field in ('f1','precision','recall','accuracy','roc_auc','pr_auc','confusion_matrix'):
             require(control[field] == row['test_'+field], f'Robustness control mismatch: {label}/{field}')
         robust_reports[label] = report
-    drift = load_json(root / 'data/drift/drift_metadata.json')
     require(drift['reference_verification']['verified'] is True and drift['reference_rows'] == heldout['test_rows']
             and set(drift['scenarios']) == SCENARIOS and all(s['rows'] == heldout['test_rows'] for s in drift['scenarios'].values()),
             'Drift provenance mismatch')

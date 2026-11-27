@@ -95,7 +95,49 @@ The verifier clones each tag from `origin` in a temporary directory, overrides t
 4. Create a new annotated `model-vMAJOR.MINOR.PATCH` tag at that commit and push the tag. Do not change previous release tags.
 5. Run `python -m scripts.manage_reference verify --current-tag NEW_TAG --backup-tag TRANSACTION_ID=PREVIOUS_TAG`. Inspect the result; then repeat with `--remove-backups` to finalize. The previous tag must match the saved pointer and every backup file.
 
-The existing candidate-evaluation and fairness scripts are still Phase 4-specific; this update does not generalize their evaluation protocols or authorize new test evaluations.
+### Candidate evaluation before a future release
+
+This workflow is separate from ordinary `--quick` and `--full` orchestration. It is not necessary to rerun it for the already promoted XGBoost release. The evaluator supports new candidate IDs and algorithm families within the existing `no_fnlwgt` representation and original Adult Income split. A new dataset or representation requires a newly reviewed evaluation protocol, not an override of these checks.
+
+1. Run training-only CV or Optuna. Review the CV results and prepare a new frozen candidate YAML using `configs/candidate_validation.yml` as an example, without overwriting the historical plan. Use `cv_training_summary.json` for the training hash, fold hash and settings, and the CV leaderboard for successful candidates' run IDs, family, variant, F1 and effective preprocessing hash. Include the full effective hyperparameters (not just Optuna's sampled parameters). Use a single representation, common fold identity and consistent settings. If the number of CV folds differs from three, include `n_splits` in the plan and match the active CV configuration.
+2. Fit and validate the reviewed shortlist with `python -m scripts.validate_candidates --plan PATH_TO_REVIEWED_PLAN.yml`. Record the new validation execution ID. Threshold calibration remains training-only; the validation winner must be unique and have F1 of at least 0.65. No test labels are accessed.
+3. Run development preflight and review the candidate, active reference, threshold, validation F1 and approval digest. The digest is a content binding, not a signature or an independent certification. Load only trusted local serialized models.
+
+```bash
+python -m scripts.evaluate_candidates --run-id VALIDATION_RUN_ID
+```
+
+4. Only after explicit review, if use of the already-exposed historical test partition is justified, run:
+
+```bash
+python -m scripts.evaluate_candidates --run-id VALIDATION_RUN_ID \
+  --evaluate --approval-sha256 REVIEWED_PREFLIGHT_DIGEST
+```
+
+Only the frozen validation winner and active reference are scored. No alternative is selected by test results. Both full and unseen F1 must be within 0.01 of the active reference or better. The approval becomes invalid if the frozen metadata, validation run or current reference changes. A successful check is a regression comparison, not independent external validation. Do not repeatedly evaluate candidates on the historical partition to optimize them.
+
+5. Generate deterministic drift data and run the paired audit using the newly generated held-out report. This step requires a passing held-out gate and verifies that test identities and predictions reproduce the report before auditing. Paired robustness uses the same drift scenarios and frozen thresholds for the candidate and reference.
+
+```bash
+python -m src.data.drift_generator
+python -m scripts.evaluate_fairness \
+  --heldout-summary reports/heldout/HELDOUT_ID/heldout_summary.json \
+  --robustness
+```
+
+Fairness reports are written under `reports/fairness/FAIRNESS_ID/`. Paired robustness reports are written under `reports/robustness/HELDOUT_ID/` (not a shared `phase4` directory). Review both before any promotion; no quantitative fairness or robustness pass threshold has been established. The historical reports use the original protocol and remain available in the tagged release evidence; they are not new approval inputs.
+
+6. Use the normal explicit promotion dry run, review the complete evidence, and confirm the separate promotion digest:
+
+```bash
+python -m src.models.promote --run-id VALIDATION_RUN_ID \
+  --heldout-id HELDOUT_ID --fairness-id FAIRNESS_ID
+python -m src.models.promote --run-id VALIDATION_RUN_ID \
+  --heldout-id HELDOUT_ID --fairness-id FAIRNESS_ID \
+  --approval-sha256 REVIEWED_PROMOTION_DIGEST --confirm
+```
+
+The promotion dry run verifies matching held-out, fairness, drift and robustness evidence, plus current reference identity and scenario file checksums. It never fits or scores a model. Follow the DVC publication, release tagging and recovery process above. Preserve the experimental records before cleaning. If the saved partition fingerprints differ after regeneration, stop and investigate instead of bypassing integrity checks.
 
 ## Fresh clone and historical recovery
 
