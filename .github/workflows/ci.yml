@@ -37,11 +37,11 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install "dvc[s3]==3.67.1"
 
-      # 4. The real-data validation tests require the DVC-managed dataset.
+      # 4. Real-data and inference tests require the dataset and approved reference.
       # Public-read S3 objects can be downloaded without AWS credentials.
-      - name: Pull DVC training data
+      - name: Pull DVC test artifacts
         run: |
-          dvc pull data/raw.dvc --verbose
+          dvc pull data/raw.dvc models/reference.dvc --verbose
 
       # 5. Execute complete test suite, including real-data validation.
       - name: Run unit and integration tests
