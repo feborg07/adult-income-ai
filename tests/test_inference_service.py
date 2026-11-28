@@ -235,3 +235,123 @@ def test_invalid_metadata_json(release, monkeypatch):
     with pytest.raises(service.ReferenceLoadError) as caught:
         service.load_reference(directory)
     assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+@pytest.fixture
+def prediction_payload(sample_adult_df):
+    """Return complete synthetic input with one education representation."""
+    return sample_adult_df.iloc[1][
+        [name for name in FEATURE_COLUMNS if name not in ("fnlwgt", "education-num")]
+    ].to_dict()
+
+
+@pytest.fixture
+def loaded_reference(release):
+    """Load a disposable approved pipeline for prediction tests."""
+    return service.load_reference(release[0])
+
+
+def test_prediction_matches_pipeline(loaded_reference, prediction_payload, sample_adult_df):
+    """Match the real synthetic XGBoost probability and saved decision rule."""
+    from dataclasses import asdict
+
+    original = prediction_payload.copy()
+    result = service.predict(loaded_reference, prediction_payload)
+    raw = sample_adult_df[list(loaded_reference.schema.required_features)].iloc[[1]]
+    expected = float(loaded_reference.model.predict_proba(raw)[0, 1])
+    assert result.positive_class_score == expected
+    assert result.predicted_class == int(expected >= loaded_reference.threshold)
+    assert result.predicted_income == (">50K" if result.predicted_class else "<=50K")
+    assert result.threshold == loaded_reference.threshold
+    assert result.positive_class == 1
+    assert result.model_sha256 == loaded_reference.model_sha256
+    assert result.approval_sha256 == loaded_reference.approval_sha256
+    assert result.model_family == loaded_reference.model_family
+    assert result.preprocessing_variant == loaded_reference.preprocessing_variant
+    assert result.representation == loaded_reference.representation
+    assert result.limitations == service.LIMITATIONS
+    assert prediction_payload == original
+    assert json.loads(json.dumps(asdict(result), allow_nan=False))["predicted_class"] == result.predicted_class
+    with pytest.raises(FrozenInstanceError):
+        result.threshold = 0.5
+
+
+def test_prediction_reuses_reference(loaded_reference, prediction_payload, monkeypatch):
+    """Reuse the loaded pipeline without refitting, reloading or default prediction."""
+    def forbidden(*args, **kwargs):
+        """Fail if prediction attempts an unrelated model operation."""
+        pytest.fail("Inference must use the existing fitted predict_proba path")
+
+    monkeypatch.setattr(service.joblib, "load", forbidden)
+    monkeypatch.setattr(loaded_reference.model, "fit", forbidden)
+    monkeypatch.setattr(loaded_reference.model, "predict", forbidden)
+    first = service.predict(loaded_reference, prediction_payload)
+    assert service.predict(loaded_reference, prediction_payload) == first
+    numeric = prediction_payload.copy()
+    numeric.pop("education")
+    numeric["education-num"] = 14
+    assert service.predict(loaded_reference, numeric) == first
+
+
+@pytest.mark.parametrize("offset,expected", [(-1, 0), (0, 1), (1, 1)])
+def test_prediction_threshold(loaded_reference, prediction_payload, monkeypatch, offset, expected):
+    """Apply the exact approved threshold, including equality and nearby values."""
+    import numpy as np
+
+    threshold = loaded_reference.threshold
+    score = threshold if offset == 0 else np.nextafter(threshold, np.inf if offset > 0 else -np.inf)
+
+    def probabilities(frame):
+        """Return controlled scores and verify canonical raw input order."""
+        assert tuple(frame.columns) == loaded_reference.schema.required_features
+        assert frame.shape == (1, 13)
+        assert frame.iloc[0]["education-num"] == 14
+        return np.array([[1 - score, score]])
+
+    monkeypatch.setattr(loaded_reference.model, "predict_proba", probabilities)
+    result = service.predict(loaded_reference, prediction_payload)
+    assert result.predicted_class == expected
+    assert result.positive_class_score == score
+
+
+@pytest.mark.parametrize("field,value", [("age", 120), ("race", None), ("fnlwgt", 1000),
+                                         ("education-num", 13)])
+def test_invalid_prediction_input(loaded_reference, prediction_payload, monkeypatch, field, value):
+    """Preserve validation errors and do not invoke the model for invalid input."""
+    from src.inference.schema import InputValidationError
+
+    def forbidden(*args, **kwargs):
+        """Fail if invalid input reaches prediction."""
+        pytest.fail("Invalid input reached the model")
+
+    monkeypatch.setattr(loaded_reference.model, "predict_proba", forbidden)
+    prediction_payload[field] = value
+    with pytest.raises(InputValidationError):
+        service.predict(loaded_reference, prediction_payload)
+
+
+@pytest.mark.parametrize("values", [[[0.3]], [[0.3, 0.3]], [[-0.1, 1.1]],
+                                     [[float("nan"), 0.5]], [[float("inf"), 0.5]],
+                                     [[0.5, 0.5], [0.5, 0.5]]])
+def test_invalid_model_probabilities(loaded_reference, prediction_payload, monkeypatch, values):
+    """Reject malformed or invalid model output rather than fabricate a class."""
+    def probabilities(frame):
+        """Return deliberately invalid probabilities."""
+        return values
+
+    monkeypatch.setattr(loaded_reference.model, "predict_proba", probabilities)
+    with pytest.raises(service.PredictionError) as caught:
+        service.predict(loaded_reference, prediction_payload)
+    assert isinstance(caught.value.__cause__, ValueError)
+
+
+def test_prediction_failure(loaded_reference, prediction_payload, monkeypatch):
+    """Expose a stable inference failure while preserving its diagnostic."""
+    def broken(frame):
+        """Simulate a failed model call."""
+        raise RuntimeError("Model execution failed")
+
+    monkeypatch.setattr(loaded_reference.model, "predict_proba", broken)
+    with pytest.raises(service.PredictionError, match="valid prediction") as caught:
+        service.predict(loaded_reference, prediction_payload)
+    assert isinstance(caught.value.__cause__, RuntimeError)

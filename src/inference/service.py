@@ -1,5 +1,6 @@
-"""Load a trusted, approved inference reference without training or data access."""
+"""Load and use a trusted, approved reference without training or data access."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
@@ -7,13 +8,15 @@ from pathlib import Path
 import warnings
 
 import joblib
+import pandas as pd
 from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_is_fitted
 
 from scripts.manage_reference import reference_metadata
 from src.models.promote import MODEL_FILENAME, rate, evidence_row
-from src.inference.schema import InputSchema, build_input_schema
+from src.inference.schema import InputSchema, build_input_schema, validate_input
+from src.models.tasks.binary_classification import positive_probabilities
 
 DEFAULT_REFERENCE = Path(__file__).resolve().parents[2] / "models" / "reference"
 
@@ -126,3 +129,64 @@ def load_reference(reference_dir: Path = DEFAULT_REFERENCE) -> LoadedReference:
             "Verify the trusted DVC release (dvc pull models/reference.dvc) "
             "and its pinned runtime dependencies."
         ) from exc
+
+
+class PredictionError(RuntimeError):
+    """Indicate a prediction failure after successful input validation."""
+
+
+@dataclass(frozen=True)
+class PredictionResult:
+    """Expose a structured binary prediction and release provenance."""
+
+    predicted_class: int
+    predicted_income: str
+    positive_class_score: float
+    positive_class: int
+    threshold: float
+    model_family: str
+    preprocessing_variant: str
+    representation: str
+    model_sha256: str
+    approval_sha256: str
+    limitations: tuple[str, ...]
+
+
+LIMITATIONS = (
+    "Educational demonstration using historical U.S. census data; not a current income estimate.",
+    "The positive-class score is not established as a calibrated probability.",
+    "Demographic predictors and historical disparities may affect predictions. "
+    "Not suitable for employment, lending, eligibility or other consequential decisions.",
+)
+
+
+def predict(reference: LoadedReference, payload: Mapping[str, object]) -> PredictionResult:
+    """Validate one observation and predict using an already verified reference.
+
+    InputValidationError is propagated unchanged for field-level clarification.
+    PredictionError indicates an inference failure, never a substitute prediction.
+    The caller retains the loaded reference for subsequent requests.
+    """
+    validated = validate_input(payload, reference.schema)
+    try:
+        # The fitted pipeline owns every transformation.
+        frame = pd.DataFrame([validated], columns=list(reference.schema.required_features))
+        score = float(positive_probabilities(reference.model, frame)[0])
+        # Use the approved cutoff instead of the estimator's default rule.
+        label = int(score >= reference.threshold)
+    except Exception as exc:
+        raise PredictionError("The approved model could not produce a valid prediction.") from exc
+
+    return PredictionResult(
+        predicted_class=label,
+        predicted_income=">50K" if label else "<=50K",
+        positive_class_score=score,
+        positive_class=reference.positive_class,
+        threshold=reference.threshold,
+        model_family=reference.model_family,
+        preprocessing_variant=reference.preprocessing_variant,
+        representation=reference.representation,
+        model_sha256=reference.model_sha256,
+        approval_sha256=reference.approval_sha256,
+        limitations=LIMITATIONS,
+    )
