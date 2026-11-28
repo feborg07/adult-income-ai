@@ -4,9 +4,9 @@
 
 ## 1. Purpose
 
-This document preserves the initial model performance inherited from the completed Sprint 17 MLOps project. It serves as a permanent benchmark for subsequent feature engineering, algorithm selection, and hyperparameter optimization experiments.
+This document records the initial model performance established during development of Adult Income AI. It serves as a permanent benchmark for subsequent feature engineering, algorithm selection, and hyperparameter optimization experiments.
 
-The original promoted reference model remains unchanged.
+The original reference model is preserved as a historical release; it is not the active reference.
 
 ## 2. Model Configuration
 
@@ -72,7 +72,7 @@ Best validation F1 by algorithm family:
 
 ## 6. Model Provenance
 
-### Original Sprint 17 Reference
+### Original Baseline Reference
 
 - Execution ID: `ad7990374a3f453b9d879498349f714f`
 - MLflow run ID: `fb19332ef80a4af49081c2c8434f16f3`
@@ -80,7 +80,7 @@ Best validation F1 by algorithm family:
 - Promotion date: November 16, 2026
 - Promotion type: explicit
 
-### Reproduced Final Project Execution
+### Reproduced Baseline Execution
 
 - Execution ID: `15fb25b789db4fecb3d0c16992b83200`
 - MLflow run ID: `3ff7fd7dceee4edc9701aed8442368ae`

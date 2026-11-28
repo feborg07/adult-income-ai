@@ -100,7 +100,7 @@ jobs:
       - name: Write training summary
         if: always()
         run: |
-          echo "## Sprint 17 — CI Training" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Adult Income AI — CI Training" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Training mode: validation-only CV (first configuration)" >> "$GITHUB_STEP_SUMMARY"
           echo "- Minimum mean CV F1: $MIN_CV_F1" >> "$GITHUB_STEP_SUMMARY"

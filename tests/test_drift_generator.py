@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Module: tests/test_drift_generator.py
 
 Unit and integration tests for synthetic covariate drift.

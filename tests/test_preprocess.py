@@ -1,5 +1,5 @@
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 File: tests/test_preprocess.py
 
 Unit and integration tests for the configurable Adult Income

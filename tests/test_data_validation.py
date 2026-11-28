@@ -53,7 +53,7 @@ def test_expected_columns_are_present(adult_data: pd.DataFrame) -> None:
 
 
 def test_dataset_size_and_feature_types(adult_data: pd.DataFrame) -> None:
-    """The real dataset must meet the sprint's tabular-data requirements."""
+    """The real dataset must meet the project's tabular-data requirements."""
     assert len(adult_data) == 48_842
     assert len(adult_data) >= 1_000
     assert len(COLUMN_NAMES) - 1 >= 8

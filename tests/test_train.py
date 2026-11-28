@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Module: tests/test_train.py
 
 Tests for isolated training executions, candidate models,

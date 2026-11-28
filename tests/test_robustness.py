@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Tests: tests/test_robustness.py
 
 Tests for src/models/robustness.py.
@@ -280,7 +280,7 @@ def test_file_sha256_matches_hashlib(tmp_path):
     import hashlib
 
     path = tmp_path / "sample.bin"
-    content = b"Sprint 17 robustness test"
+    content = b"Adult Income AI robustness test"
 
     path.write_bytes(content)
 

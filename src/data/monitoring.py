@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Module: src/data/monitoring.py
 
 Detect covariate drift using Evidently 0.7.23.
@@ -716,7 +716,7 @@ def main(
         summary = run_monitoring_pipeline(config)
 
         print("\n" + "=" * 55)
-        print("SPRINT 17 - DATA DRIFT MONITORING")
+        print("ADULT INCOME AI - DATA DRIFT MONITORING")
         print("=" * 55)
 
         for scenario, result in summary["scenarios"].items():

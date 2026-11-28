@@ -85,7 +85,7 @@ jobs:
           PIPELINE_RESULT: ${{ job.status }}
         run: |
           {
-            echo "## Sprint 17 — MLOps Pipeline"
+            echo "## Adult Income AI — MLOps Pipeline"
             echo ""
             echo "- Training mode: $TRAINING_MODE"
             echo "- Pipeline result: $PIPELINE_RESULT"

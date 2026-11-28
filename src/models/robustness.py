@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Module: src/models/robustness.py
 
 Evaluate the robustness of the reference model against
@@ -572,7 +572,7 @@ def run_robustness(args):
 
     print()
     print("=" * 68)
-    print("SPRINT 17 - MODEL ROBUSTNESS EVALUATION")
+    print("ADULT INCOME AI - MODEL ROBUSTNESS EVALUATION")
     print("=" * 68)
     print(
         f"{'SCENARIO':<12}"

@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Module: tests/test_monitoring.py
 
 Tests for Evidently 0.7.23 data drift monitoring.

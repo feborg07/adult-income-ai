@@ -1,5 +1,5 @@
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 Module: src/data/preprocess.py
 
 Purpose

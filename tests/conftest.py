@@ -1,5 +1,5 @@
 """
-Sprint 17 - MLOps Final Project
+Adult Income AI
 File: tests/conftest.py
 
 Purpose

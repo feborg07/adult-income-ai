@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - Project File Audit
+Adult Income AI - Project File Audit
 
 Recursively inspect the repository for:
     - Empty files (0 bytes)
@@ -226,7 +226,7 @@ def main():
     root = results["root"]
 
     print("\n" + "=" * 65)
-    print("SPRINT 17 - PROJECT FILE AUDIT")
+    print("ADULT INCOME AI - PROJECT FILE AUDIT")
     print("=" * 65)
 
     print(f"Project: {root}")

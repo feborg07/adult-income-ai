@@ -1,6 +1,6 @@
 
 """
-Sprint 17 - MLOps Pipeline Orchestrator
+Adult Income AI - MLOps Pipeline Orchestrator
 
 Runs the complete ML workflow locally or through GitHub Actions.
 
@@ -243,7 +243,7 @@ def run_pipeline(
 
     started_at = datetime.now(timezone.utc)
 
-    LOGGER.info("SPRINT 17 - MLOPS PIPELINE")
+    LOGGER.info("ADULT INCOME AI - MLOPS PIPELINE")
     LOGGER.info("Training mode: %s", training_mode)
     LOGGER.info("Project root: %s", PROJECT_ROOT)
     LOGGER.info("Started (UTC): %s", started_at.isoformat())
@@ -435,7 +435,7 @@ def run_pipeline(
     )
 
     LOGGER.info("=" * 60)
-    LOGGER.info("SPRINT 17 - PIPELINE COMPLETED")
+    LOGGER.info("ADULT INCOME AI - PIPELINE COMPLETED")
     LOGGER.info("=" * 60)
 
     for result in results:
@@ -467,7 +467,7 @@ def main() -> int:
     """Parse CLI arguments and execute the pipeline."""
 
     parser = argparse.ArgumentParser(
-        description="Sprint 17 MLOps pipeline orchestrator."
+        description="Adult Income AI MLOps pipeline orchestrator."
     )
 
     mode = parser.add_mutually_exclusive_group()

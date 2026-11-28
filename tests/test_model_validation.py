@@ -1,4 +1,4 @@
-"""Small, deterministic model validation tests required by Sprint 17.
+"""Small, deterministic model validation tests for Adult Income AI.
 
 These tests deliberately do not invoke the 12-/54-candidate training sweep.
 They validate the scikit-learn prediction contract and a minimal F1 score on
